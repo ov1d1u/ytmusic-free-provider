@@ -455,3 +455,69 @@ def test_ordinary_playlist_does_not_replace_music_videos(provider):
     assert [track.item_id for track in tracks] == ["video000001"]
     client.search.assert_not_called()
     client.get_watch_playlist.assert_not_called()
+
+
+def test_featured_editorial_playlist_replaces_drops_and_reindexes(provider):
+    first_audio = _audio(
+        "audio000001",
+        duration="1:01",
+        album={"id": "album-audio", "name": "Audio Album"},
+    )
+    second_audio = _audio(
+        "audio000002",
+        title="Second Song",
+        duration="0:42",
+    )
+    client = MagicMock()
+    client.get_playlist.return_value = {
+        "trackCount": 4,
+        "tracks": [
+            _track("video000001", counterpart=first_audio),
+            _track(
+                "video000002",
+                title="Second Song (Official Music Video)",
+                video_type=UGC,
+            ),
+            _track("video000003", title="No Matching Audio", artist="Nobody"),
+            _track("video000004", counterpart=first_audio),
+        ],
+    }
+
+    def _search(query, filter, limit):  # noqa: A002
+        return [second_audio] if query.startswith("The Artist Second Song") else []
+
+    client.search.side_effect = _search
+    provider._ytmusic = client
+
+    tracks = asyncio.run(
+        provider.get_playlist_tracks(
+            "RDCLAK5uy_k6PkYWus1Mt-aKrbb0Ne8SkA2BgAk1Yy4"
+        )
+    )
+
+    assert [track.item_id for track in tracks] == ["audio000001", "audio000002"]
+    assert [track.position for track in tracks] == [1, 2]
+    assert [track.duration for track in tracks] == [61, 42]
+    assert tracks[0].album.item_id == "album-audio"
+    client.get_playlist.assert_called_once()
+
+
+def test_featured_editorial_playlist_keeps_full_playlist_endpoint(provider):
+    client = MagicMock()
+    client.get_playlist.return_value = {
+        "trackCount": 2,
+        "tracks": [_audio("audio000001"), _audio("audio000002")],
+    }
+    provider._ytmusic = client
+
+    tracks = asyncio.run(
+        provider.get_playlist_tracks(
+            "RDCLAK5uy_k6PkYWus1Mt-aKrbb0Ne8SkA2BgAk1Yy4"
+        )
+    )
+
+    assert [track.item_id for track in tracks] == ["audio000001", "audio000002"]
+    client.get_playlist.assert_called_once_with(
+        "RDCLAK5uy_k6PkYWus1Mt-aKrbb0Ne8SkA2BgAk1Yy4", limit=None
+    )
+    client.get_watch_playlist.assert_not_called()

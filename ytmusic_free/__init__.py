@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 
 import asyncio
 import importlib
@@ -696,6 +696,11 @@ def _is_watch_only_playlist_id(playlist_id: str) -> bool:
     return bare_id.startswith(_YT_RADIO_PREFIX) and not bare_id.startswith(
         _YT_EDITORIAL_PREFIX
     )
+
+
+def _is_editorial_playlist_id(playlist_id: str) -> bool:
+    """Whether this is a YouTube-curated playlist surfaced by the home feed."""
+    return _strip_browse_prefix(playlist_id).startswith(_YT_EDITORIAL_PREFIX)
 
 
 def _radio_seed_video_id(playlist_id: str) -> str | None:
@@ -2787,6 +2792,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """
         if page > 0:
             return []
+        prefer_atv = _is_editorial_playlist_id(prov_playlist_id)
         # Only ids that nothing else will answer for go to the radio endpoint
         # first. Editorial RDCLAK5uy_ playlists are deliberately excluded: the
         # watch endpoint does answer for them, so routing them here looked
@@ -2807,12 +2813,27 @@ class YoutubeMusicFreeProvider(MusicProvider):
             if not playlist_obj or "tracks" not in playlist_obj:
                 raise ValueError("No tracks in playlist response")
             tracks_raw = playlist_obj["tracks"] or []
+            parse_items = tracks_raw
+            if prefer_atv:
+                resolved_raw = await self._resolve_preferred_audio_batch(
+                    [
+                        ("editorial", track_obj)
+                        for track_obj in tracks_raw
+                        if isinstance(track_obj, dict)
+                    ]
+                )
+                parse_items = [track_obj for _, track_obj in resolved_raw]
             result = []
-            for index, track_obj in enumerate(tracks_raw, 1):
+            for index, track_obj in enumerate(parse_items, 1):
                 if not track_obj.get("isAvailable", True):
                     continue
                 with suppress(InvalidDataError, KeyError, TypeError):
-                    track = self._parse_track(track_obj)
+                    parse_obj = (
+                        _normalize_watch_track(track_obj)
+                        if prefer_atv
+                        else track_obj
+                    )
+                    track = self._parse_track(parse_obj)
                     if track:
                         track.position = index
                         result.append(track)
@@ -2830,11 +2851,19 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 # already parsed a track, hand its id over so the fallback has
                 # a usable URL instead of a guaranteed failure.
                 seed = _split_track_id(result[0].item_id)[0] if result else None
-                ytdlp_result = await self._get_playlist_tracks_via_ytdlp(
-                    prov_playlist_id, seed
-                )
+                if prefer_atv:
+                    ytdlp_result = await self._get_playlist_tracks_via_ytdlp(
+                        prov_playlist_id, seed, prefer_atv=True
+                    )
+                else:
+                    ytdlp_result = await self._get_playlist_tracks_via_ytdlp(
+                        prov_playlist_id, seed
+                    )
                 if len(ytdlp_result) > len(result):
                     result = self._merge_playlist_track_results(result, ytdlp_result)
+            if prefer_atv:
+                for index, track in enumerate(result, 1):
+                    track.position = index
             await self._attach_album_years(result)
             return result
         except (MediaNotFoundError, UnplayableMediaError):
@@ -2874,6 +2903,10 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 radio_tracks = await self._get_radio_playlist_tracks(prov_playlist_id)
                 if radio_tracks is not None:
                     return radio_tracks
+            if prefer_atv:
+                return await self._get_playlist_tracks_via_ytdlp(
+                    prov_playlist_id, prefer_atv=True
+                )
             return await self._get_playlist_tracks_via_ytdlp(prov_playlist_id)
 
     @staticmethod
@@ -2986,7 +3019,11 @@ class YoutubeMusicFreeProvider(MusicProvider):
         return playlist
 
     async def _get_playlist_tracks_via_ytdlp(
-        self, playlist_id: str, seed_video_id: str | None = None
+        self,
+        playlist_id: str,
+        seed_video_id: str | None = None,
+        *,
+        prefer_atv: bool = False,
     ) -> list[Track]:
         """Get playlist tracks via yt-dlp flat extraction (no auth required).
 
@@ -3023,28 +3060,38 @@ class YoutubeMusicFreeProvider(MusicProvider):
         if not info or not info.get("entries"):
             return []
 
-        result = []
-        for index, entry in enumerate(info["entries"] or [], 1):
+        raw_tracks: list[dict[str, Any]] = []
+        for entry in info["entries"] or []:
             if not entry or not entry.get("id"):
                 continue
+            duration_val = entry.get("duration")
+            track_obj = {
+                "videoId": entry["id"],
+                "title": entry.get("title") or entry["id"],
+                "duration": int(duration_val) if duration_val is not None else None,
+                "artists": [
+                    {
+                        "name": entry.get("uploader") or entry.get("channel") or "Unknown",
+                        "id": None,
+                    }
+                ],
+                "thumbnails": entry.get("thumbnails") or [],
+                "isAvailable": True,
+            }
+            # Remove None duration so _parse_track doesn't choke on it.
+            if track_obj["duration"] is None:
+                del track_obj["duration"]
+            raw_tracks.append(track_obj)
+
+        if prefer_atv:
+            resolved_raw = await self._resolve_preferred_audio_batch(
+                [("editorial-ytdlp", track_obj) for track_obj in raw_tracks]
+            )
+            raw_tracks = [track_obj for _, track_obj in resolved_raw]
+
+        result = []
+        for index, track_obj in enumerate(raw_tracks, 1):
             try:
-                duration_val = entry.get("duration")
-                track_obj = {
-                    "videoId": entry["id"],
-                    "title": entry.get("title") or entry["id"],
-                    "duration": int(duration_val) if duration_val is not None else None,
-                    "artists": [
-                        {
-                            "name": entry.get("uploader") or entry.get("channel") or "Unknown",
-                            "id": None,
-                        }
-                    ],
-                    "thumbnails": entry.get("thumbnails") or [],
-                    "isAvailable": True,
-                }
-                # Remove None duration so _parse_track doesn't choke on it
-                if track_obj["duration"] is None:
-                    del track_obj["duration"]
                 track = self._parse_track(track_obj)
                 if track:
                     track.position = index

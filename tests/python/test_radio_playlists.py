@@ -78,6 +78,16 @@ def test_editorial_and_static_playlists_are_not_watch_only(playlist_id):
     assert not ytm._is_watch_only_playlist_id(playlist_id)
 
 
+@pytest.mark.parametrize("playlist_id", [EDITORIAL_ID, f"VL{EDITORIAL_ID}"])
+def test_editorial_playlist_ids_are_classified(playlist_id):
+    assert ytm._is_editorial_playlist_id(playlist_id)
+
+
+@pytest.mark.parametrize("playlist_id", [SUPERMIX_ID, STATIC_ID, "OLAK5uy_abc123"])
+def test_non_editorial_playlist_ids_are_not_classified(playlist_id):
+    assert not ytm._is_editorial_playlist_id(playlist_id)
+
+
 def test_song_radio_ids_yield_their_seed_video():
     assert ytm._radio_seed_video_id(SONG_RADIO_ID) == "dQw4w9WgXcQ"
     assert ytm._radio_seed_video_id(VIDEO_RADIO_ID) == "dQw4w9WgXcQ"
@@ -276,7 +286,12 @@ def _numbered_playlist(count):
     return {
         "trackCount": count,
         "tracks": [
-            {"videoId": f"vid{n}", "title": f"Song {n}", "artists": [{"id": "UC1", "name": "A"}]}
+            {
+                "videoId": f"vid{n}",
+                "title": f"Song {n}",
+                "artists": [{"id": "UC1", "name": "A"}],
+                "videoType": ytm.VIDEO_TYPE_ATV,
+            }
             for n in range(count)
         ],
     }

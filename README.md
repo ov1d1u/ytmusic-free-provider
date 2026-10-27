@@ -481,16 +481,18 @@ For example, run the script with `--video-id Ahha3Cqe_fk --limit 1` to search fo
 the audio of Katy Perry's “The One That Got Away”.
 
 The provider applies the same conservative title-and-artist matching more
-broadly to text-search results, personal mixes and song radio. It keeps an Art
-Track, prefers a verified Art Track counterpart, and otherwise searches the
-Songs catalogue. A missing type is verified against the watch-queue entry with
-the exact same video id; the first queue item is never trusted blindly. Music
-videos and uploads are removed when no confident Art Track can be found, and
-several inputs that resolve to the same Art Track are deduplicated. Durations
-are deliberately not compared because a video may contain an intro or extra
-scenes. Explicitly pasted video URLs still resolve to that exact video, and
-ordinary playlists, library contents, podcasts and home recommendations are
-outside this replacement logic.
+broadly to text-search results, personal mixes, song radio and YouTube's
+editorial playlists (the `RDCLAK5uy_...` lists commonly shown under “Featured
+playlists for you”). It keeps an Art Track, prefers a verified Art Track
+counterpart, and otherwise searches the Songs catalogue. A missing type is
+verified against the watch-queue entry with the exact same video id; the first
+queue item is never trusted blindly. Music videos and uploads are removed when
+no confident Art Track can be found, and several inputs that resolve to the
+same Art Track are deduplicated. Durations are deliberately not compared
+because a video may contain an intro or extra scenes. Explicitly pasted video
+URLs still resolve to that exact video, and user-created/manual playlists,
+library contents, podcasts and the recommendation cards themselves are outside
+this replacement logic.
 
 ---
 
