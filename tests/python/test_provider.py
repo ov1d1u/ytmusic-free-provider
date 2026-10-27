@@ -1829,6 +1829,7 @@ def test_search_one_failing_filter_does_not_sink_others(provider):
                 "resultType": "song",
                 "videoId": "vid1",
                 "title": "Song",
+                "videoType": ytm.VIDEO_TYPE_ATV,
                 "artists": [{"id": "UCart", "name": "A"}],
             }
         ]
@@ -1851,6 +1852,7 @@ def test_search_parses_returned_items_by_result_type(provider):
                 "resultType": "song",
                 "videoId": "vid1",
                 "title": "Song",
+                "videoType": ytm.VIDEO_TYPE_ATV,
                 "artists": [{"id": "UCart", "name": "Some Artist"}],
             }
         ],
@@ -1893,6 +1895,7 @@ def test_search_skips_invalid_items(provider):
             "resultType": "song",
             "videoId": "good",
             "title": "ok",
+            "videoType": ytm.VIDEO_TYPE_ATV,
             "artists": [{"id": "UCart", "name": "A"}],
         },
     ]
@@ -1915,6 +1918,7 @@ def test_search_merges_videos_below_catalog_songs(provider):
                 "resultType": "song",
                 "videoId": "song1",
                 "title": "Catalog Song",
+                "videoType": ytm.VIDEO_TYPE_ATV,
                 "artists": [{"id": "UCart", "name": "A"}],
             }
         ],
@@ -1923,7 +1927,7 @@ def test_search_merges_videos_below_catalog_songs(provider):
                 "resultType": "video",
                 "videoId": "vid1",
                 "title": "Live in Madrid",
-                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "videoType": ytm.VIDEO_TYPE_ATV,
                 "artists": [{"id": None, "name": "Some Channel"}],
             }
         ],
@@ -1943,6 +1947,7 @@ def test_search_dedupes_same_video_id_across_filters(provider):
         "resultType": "song",
         "videoId": "dup1",
         "title": "Song",
+        "videoType": ytm.VIDEO_TYPE_ATV,
         "artists": [{"id": "UCart", "name": "A"}],
     }
     mock = MagicMock()
@@ -1970,7 +1975,7 @@ def test_search_skips_podcast_episodes_from_videos_filter(provider):
                 "resultType": "video",
                 "videoId": "vid1",
                 "title": "Actual Video",
-                "videoType": "MUSIC_VIDEO_TYPE_OMV",
+                "videoType": ytm.VIDEO_TYPE_ATV,
                 "artists": [{"id": "UCart", "name": "A"}],
             },
         ],
@@ -1993,7 +1998,7 @@ def test_search_parses_video_without_duration(provider):
                 "resultType": "video",
                 "videoId": "live1",
                 "title": "Concert Stream",
-                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "videoType": ytm.VIDEO_TYPE_ATV,
                 "duration": None,
                 "artists": [{"id": None, "name": "Some Channel"}],
             }
@@ -2007,10 +2012,8 @@ def test_search_parses_video_without_duration(provider):
     assert results.tracks[0].duration == 0
 
 
-def test_search_keeps_video_without_artists(provider):
-    """A videos-tab result sometimes carries no artists key at all; those are
-    exactly the plain-YouTube uploads issue #77 surfaces, so they must fall
-    back to a placeholder artist instead of being dropped as malformed."""
+def test_search_drops_video_without_artists(provider):
+    """A replacement cannot be matched confidently without artist metadata."""
     by_filter = {
         "songs": [],
         "videos": [
@@ -2026,8 +2029,7 @@ def test_search_keeps_video_without_artists(provider):
     mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
     provider._ytmusic = mock
     results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
-    assert [t.item_id for t in results.tracks] == ["noart1"]
-    assert [a.name for a in results.tracks[0].artists] == ["Unknown Artist"]
+    assert results.tracks == []
 
 
 def test_search_song_without_artists_still_skipped(provider):
@@ -2060,6 +2062,7 @@ def test_search_reserves_window_space_for_videos(provider):
             "resultType": "song",
             "videoId": f"s{i}",
             "title": f"Song {i}",
+            "videoType": ytm.VIDEO_TYPE_ATV,
             "artists": [{"id": "UCart", "name": "A"}],
         }
 
@@ -2070,14 +2073,14 @@ def test_search_reserves_window_space_for_videos(provider):
                 "resultType": "video",
                 "videoId": "v0",
                 "title": "Live in Madrid",
-                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "videoType": ytm.VIDEO_TYPE_ATV,
                 "artists": [{"id": None, "name": "Some Channel"}],
             },
             {
                 "resultType": "video",
                 "videoId": "v1",
                 "title": "Live in Berlin",
-                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "videoType": ytm.VIDEO_TYPE_ATV,
                 "artists": [{"id": None, "name": "Some Channel"}],
             },
         ],
@@ -2096,16 +2099,17 @@ def _catalog_song(i, title="Song"):
         "resultType": "song",
         "videoId": f"s{i}",
         "title": f"{title} {i}",
+        "videoType": ytm.VIDEO_TYPE_ATV,
         "artists": [{"id": "UCart", "name": "A"}],
     }
 
 
-def _ugc_video(video_id, title):
+def _atv_video_result(video_id, title):
     return {
         "resultType": "video",
         "videoId": video_id,
         "title": title,
-        "videoType": "MUSIC_VIDEO_TYPE_UGC",
+        "videoType": ytm.VIDEO_TYPE_ATV,
         "artists": [{"id": None, "name": "Some Channel"}],
     }
 
@@ -2124,12 +2128,13 @@ def test_search_promotes_video_matching_query_better_than_songs(provider):
                 "resultType": "song",
                 "videoId": "s0",
                 "title": "7 Seconds",
+                "videoType": ytm.VIDEO_TYPE_ATV,
                 "artists": [{"id": "UCart", "name": "Youssou N'Dour"}],
             },
             *[_catalog_song(i) for i in range(1, 8)],
         ],
         "videos": [
-            _ugc_video(
+            _atv_video_result(
                 "0pquBdxfsXY",
                 "PORRIDGE RADIO - 7 SECONDS. Live in Madrid (19-3-25). Sala Copernico Live.",
             )
@@ -2153,7 +2158,7 @@ def test_search_keeps_weakly_matching_videos_below_songs(provider):
     the ordinary case of the catalog holding the recording the user meant."""
     by_filter = {
         "songs": [_catalog_song(i, title="Catalog Song") for i in range(8)],
-        "videos": [_ugc_video("v0", "Catalog Song 0 (Live in Madrid)")],
+        "videos": [_atv_video_result("v0", "Catalog Song 0 (Live in Madrid)")],
     }
     mock = MagicMock()
     mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
@@ -2168,7 +2173,7 @@ def test_search_promoted_videos_never_evict_every_song(provider):
     search into a wall of YouTube uploads."""
     by_filter = {
         "songs": [_catalog_song(i) for i in range(8)],
-        "videos": [_ugc_video(f"v{i}", f"Live in Madrid {i}") for i in range(5)],
+        "videos": [_atv_video_result(f"v{i}", f"Live in Madrid {i}") for i in range(5)],
     }
     mock = MagicMock()
     mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
@@ -2185,8 +2190,8 @@ def test_search_does_not_reorder_videos_when_no_songs_match(provider):
     by_filter = {
         "songs": [],
         "videos": [
-            _ugc_video("v0", "Something Unrelated"),
-            _ugc_video("v1", "Live in Madrid"),
+            _atv_video_result("v0", "Something Unrelated"),
+            _atv_video_result("v1", "Live in Madrid"),
         ],
     }
     mock = MagicMock()
@@ -2200,8 +2205,8 @@ def test_split_promoted_videos_requires_a_clear_margin(provider):
     """A video only outranks the songs when it covers the query substantially
     better, so a video that ties the best song keeps its place behind it."""
     songs = [provider._parse_track(_catalog_song(0, title="Live in Madrid"))]
-    tie = provider._parse_track(_ugc_video("tie", "Live in Madrid"))
-    better = provider._parse_track(_ugc_video("better", "Live in Madrid 0 Full Concert"))
+    tie = provider._parse_track(_atv_video_result("tie", "Live in Madrid"))
+    better = provider._parse_track(_atv_video_result("better", "Live in Madrid 0 Full Concert"))
     promoted, weaker = provider._split_promoted_videos("live in madrid 0", songs, [tie, better])
     assert [t.item_id for t in promoted] == []
     assert [t.item_id for t in weaker] == ["tie", "better"]
@@ -2210,7 +2215,9 @@ def test_split_promoted_videos_requires_a_clear_margin(provider):
 def test_query_match_score_treats_punctuation_as_separators(provider):
     """Upload titles are full of dashes and dots; they must not stop the words
     the user typed from matching."""
-    track = provider._parse_track(_ugc_video("v0", "7 SECONDS. Live in Madrid (19-3-25)."))
+    track = provider._parse_track(
+        _atv_video_result("v0", "7 SECONDS. Live in Madrid (19-3-25).")
+    )
     assert ytm._query_match_score({"madrid", "19"}, track) == 1.0
     assert ytm._query_match_score({"madrid", "berlin"}, track) == 0.5
     assert ytm._query_match_score(set(), track) == 0.0
@@ -2346,6 +2353,7 @@ def test_search_with_video_url_runs_name_search_on_title(provider):
                     "resultType": "song",
                     "videoId": "related1",
                     "title": "Related",
+                    "videoType": ytm.VIDEO_TYPE_ATV,
                     "artists": [{"id": "UCx", "name": "A"}],
                 }
             ]
@@ -2373,6 +2381,7 @@ def test_search_with_video_url_dedupes_raw_video(provider):
                 "resultType": "song",
                 "videoId": "abc123",
                 "title": "Song",
+                "videoType": ytm.VIDEO_TYPE_ATV,
                 "artists": [{"id": "UCx", "name": "A"}],
             }
         ]
@@ -3810,8 +3819,8 @@ def test_similar_tracks_are_filtered(provider):
     mock = MagicMock()
     mock.get_watch_playlist.return_value = {
         "tracks": [
-            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
-            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+            {"videoId": "vid00000001", "title": "Good", "videoType": ytm.VIDEO_TYPE_ATV, "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "videoType": ytm.VIDEO_TYPE_ATV, "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
         ]
     }
     provider._ytmusic = mock
@@ -3827,8 +3836,8 @@ def test_similar_tracks_are_untouched_when_the_filter_is_off(provider):
     mock = MagicMock()
     mock.get_watch_playlist.return_value = {
         "tracks": [
-            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
-            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+            {"videoId": "vid00000001", "title": "Good", "videoType": ytm.VIDEO_TYPE_ATV, "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "videoType": ytm.VIDEO_TYPE_ATV, "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
         ]
     }
     provider._ytmusic = mock
@@ -3886,8 +3895,8 @@ def test_radio_playlist_tracks_are_filtered(provider):
     mock = MagicMock()
     mock.get_watch_playlist.return_value = {
         "tracks": [
-            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
-            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+            {"videoId": "vid00000001", "title": "Good", "videoType": ytm.VIDEO_TYPE_ATV, "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "videoType": ytm.VIDEO_TYPE_ATV, "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
         ]
     }
     provider._ytmusic = mock
@@ -3912,6 +3921,7 @@ def test_search_results_are_never_filtered(provider):
             "videoId": "vid00000002",
             "title": "Slop",
             "resultType": "song",
+            "videoType": ytm.VIDEO_TYPE_ATV,
             "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}],
         }
     ]
@@ -3970,6 +3980,7 @@ def test_cached_playlist_tracks_still_reach_the_caller(provider):
             {
                 "videoId": "vid00000001",
                 "title": "Good",
+                "videoType": ytm.VIDEO_TYPE_ATV,
                 "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}],
             }
         ]
@@ -4518,6 +4529,7 @@ def test_search_tracks_get_their_album_year(provider):
             "resultType": "song",
             "videoId": "v1",
             "title": "One",
+            "videoType": ytm.VIDEO_TYPE_ATV,
             "artists": [{"name": "A", "id": "UCa"}],
             "album": {"id": "MPREb_x", "name": "An Album"},
         }
@@ -4887,6 +4899,7 @@ def test_get_similar_tracks_parses_returned_tracks(provider):
                 {
                     "videoId": "vid1",
                     "title": "Song One",
+                    "videoType": ytm.VIDEO_TYPE_ATV,
                     "artists": [{"id": "UCart", "name": "An Artist"}],
                 },
                 # Missing videoId â€” must be skipped, not crash the radio fill.
@@ -6789,10 +6802,10 @@ def test_track_only_callers_behave_as_before(provider):
     mock = MagicMock()
     mock.get_watch_playlist.return_value = {
         "tracks": [
-            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
-            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
-            {"videoId": "vid00000003", "title": "By id", "artists": [{"name": "Innocent", "id": "UC000000000000000000000c"}]},
-            {"videoId": "vid00000004", "title": "Feat", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}, {"name": "SLOPPY BOT", "id": "UC000000000000000000000d"}]},
+            {"videoId": "vid00000001", "title": "Good", "videoType": ytm.VIDEO_TYPE_ATV, "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "videoType": ytm.VIDEO_TYPE_ATV, "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+            {"videoId": "vid00000003", "title": "By id", "videoType": ytm.VIDEO_TYPE_ATV, "artists": [{"name": "Innocent", "id": "UC000000000000000000000c"}]},
+            {"videoId": "vid00000004", "title": "Feat", "videoType": ytm.VIDEO_TYPE_ATV, "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}, {"name": "SLOPPY BOT", "id": "UC000000000000000000000d"}]},
         ]
     }
     provider._ytmusic = mock

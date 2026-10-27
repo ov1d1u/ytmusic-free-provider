@@ -431,6 +431,69 @@ playlist links.)
 
 ---
 
+## Inspecting song/video counterparts
+
+[`scripts/inspect_counterparts.py`](scripts/inspect_counterparts.py) is a standalone
+sample for examining the optional `counterpart` objects returned by
+[`get_watch_playlist`](https://ytmusicapi.readthedocs.io/en/stable/reference/watch.html).
+Run it from the repository root with Python 3.10 or newer:
+
+```sh
+python3 -m venv /tmp/ytmusic-counterpart-venv
+/tmp/ytmusic-counterpart-venv/bin/python -m pip install ytmusicapi
+/tmp/ytmusic-counterpart-venv/bin/python scripts/inspect_counterparts.py --video-id 9mWr4c_ig54
+```
+
+This requests a watch queue and prints up to ten tracks, each with its original
+ID, title, artists, duration, album, type and URL, followed by the same information
+for its counterpart when returned. Add `--limit 1` to inspect just the first
+item, or `--json` to see the returned track objects, including nested counterpart
+data and any `audio_search` report added by the script. The example ID comes
+from the API documentation; live results can change.
+
+To inspect My Supermix, copy the `list=` value from its YouTube Music URL and use
+an authenticated [browser headers JSON file](https://ytmusicapi.readthedocs.io/en/stable/setup/browser.html):
+
+```sh
+/tmp/ytmusic-counterpart-venv/bin/python scripts/inspect_counterparts.py \
+  --playlist-id YOUR_MIX_ID --auth /path/to/browser.json --limit 25
+```
+
+`MUSIC_VIDEO_TYPE_ATV` identifies album audio (an Art Track), `OMV` an official
+music video and `UGC` a user upload (the latter two have the same
+`MUSIC_VIDEO_TYPE_` prefix). A counterpart is **not automatically the audio
+version**: an album track can link to a video. Its type may also be absent, which
+the script reports as unknown. No counterpart in the response does not prove
+there is no album version.
+
+When the original is `OMV` and has no explicitly typed `ATV` counterpart, the
+script automatically searches the **Songs** catalogue using its artist and
+title. It removes labels such as `(Official Music Video)`, preserves version
+qualifiers such as live or remix, and requires matching titles and at least one
+matching artist. It examines up to ten search results and verifies up to five
+matching candidates. If a candidate's type is missing, it fetches that ID's watch
+queue and checks the entry with the same ID for `MUSIC_VIDEO_TYPE_ATV`.
+The first verified audio candidate is printed separately as a **Search match**;
+it is not presented as a YouTube-linked counterpart or proof of the identical
+recording. In this standalone diagnostic, failures and unsuccessful searches
+leave the original visible.
+For example, run the script with `--video-id Ahha3Cqe_fk --limit 1` to search for
+the audio of Katy Perry's “The One That Got Away”.
+
+The provider applies the same conservative title-and-artist matching more
+broadly to text-search results, personal mixes and song radio. It keeps an Art
+Track, prefers a verified Art Track counterpart, and otherwise searches the
+Songs catalogue. A missing type is verified against the watch-queue entry with
+the exact same video id; the first queue item is never trusted blindly. Music
+videos and uploads are removed when no confident Art Track can be found, and
+several inputs that resolve to the same Art Track are deduplicated. Durations
+are deliberately not compared because a video may contain an intro or extra
+scenes. Explicitly pasted video URLs still resolve to that exact video, and
+ordinary playlists, library contents, podcasts and home recommendations are
+outside this replacement logic.
+
+---
+
 ## Dependencies
 
 These are installed automatically by the provider on first run via the server's `install_package` utility:

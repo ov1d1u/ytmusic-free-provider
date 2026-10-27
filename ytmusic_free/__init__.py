@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 import asyncio
 import importlib
@@ -33,6 +33,8 @@ import logging
 import os
 import re
 import time
+import unicodedata
+from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
@@ -323,6 +325,27 @@ SEARCH_FILTER_VIDEOS = "videos"
 # forced to "video" by the filter); those belong to the podcast domain, not in
 # track results.
 VIDEO_TYPE_PODCAST_EPISODE = "MUSIC_VIDEO_TYPE_PODCAST_EPISODE"
+
+# YouTube Music distinguishes its album audio (Art Tracks) from official music
+# videos and ordinary uploads with these values. Search and watch responses do
+# not always carry the field, so a missing value must be verified rather than
+# guessed from the result tab, title or artwork.
+VIDEO_TYPE_ATV = "MUSIC_VIDEO_TYPE_ATV"
+
+# Replacing a video with album audio may need one Songs search and several
+# exact-id watch lookups. Keep that work bounded: a personal mix can contain
+# more than a hundred entries, and firing every lookup at once is an easy way
+# to trip YouTube's rate limiting.
+AUDIO_REPLACEMENT_CONCURRENCY = 4
+AUDIO_REPLACEMENT_SEARCH_LIMIT = 10
+AUDIO_REPLACEMENT_VERIFY_LIMIT = 5
+
+# Resolution is stable enough to reuse during a day, including a confirmed
+# "no matching ATV" result, but not forever: availability and catalogue
+# entries can change. The size cap prevents a long-lived provider instance
+# from accumulating one entry for every radio track it has ever seen.
+AUDIO_REPLACEMENT_CACHE_TTL = 24 * 3600
+AUDIO_REPLACEMENT_CACHE_SIZE = 1000
 
 # How much better a video has to match the query than the best catalog song
 # before it is ranked ahead of the songs, as a fraction of the query's tokens.
@@ -686,6 +709,61 @@ def _radio_seed_video_id(playlist_id: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _audio_text_key(text: str) -> str:
+    """Return a punctuation-, accent- and case-insensitive comparison key."""
+    normalized = unicodedata.normalize("NFKD", str(text or "").casefold())
+    return "".join(char for char in normalized if char.isalnum())
+
+
+def _audio_song_title(title: str) -> str:
+    """Remove generic video labels without discarding recording qualifiers.
+
+    ``(Official Music Video)`` is presentation metadata, while ``(Live)``,
+    ``(Remix)`` and ``(Acoustic)`` identify a different recording and must stay
+    in the title used for matching.
+    """
+    video_label = r"(?:official\s+)?(?:music\s+)?video(?:\s+(?:hd|4k))?"
+    cleaned = re.sub(
+        rf"\(\s*{video_label}\s*\)|\[\s*{video_label}\s*\]",
+        "",
+        str(title or ""),
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        rf"\s*[-–—|:]\s*{video_label}\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def _audio_artist_keys(artists: object) -> tuple[set[str], set[str]]:
+    """Return stable ids and normalized names from a YTM artist list."""
+    ids: set[str] = set()
+    names: set[str] = set()
+    if not isinstance(artists, list):
+        return ids, names
+    for artist in artists:
+        if not isinstance(artist, dict):
+            continue
+        for key in ("id", "channelId", "browseId"):
+            if value := artist.get(key):
+                ids.add(str(value))
+        if name := _audio_text_key(artist.get("name") or artist.get("artist") or ""):
+            names.add(name)
+    return ids, names
+
+
+def _usable_audio_metadata(track_obj: dict[str, Any]) -> bool:
+    """Whether an ATV object carries enough of its own data for parsing."""
+    return bool(
+        track_obj.get("videoId")
+        and track_obj.get("title")
+        and isinstance(track_obj.get("artists"), list)
+        and track_obj["artists"]
+    )
+
+
 def _normalize_watch_track(track_obj: dict[str, Any]) -> dict[str, Any]:
     """Reshape a watch/radio track into the shape ``_parse_track`` expects.
 
@@ -696,8 +774,13 @@ def _normalize_watch_track(track_obj: dict[str, Any]) -> dict[str, Any]:
     duration and no artwork.
     """
     normalized = dict(track_obj)
-    if "duration" not in normalized and "duration_seconds" not in normalized:
-        seconds = _parse_timestamp(str(normalized.get("length") or ""))
+    if "duration_seconds" not in normalized:
+        raw_duration = normalized.get("duration")
+        if "duration" not in normalized or raw_duration is None:
+            raw_duration = normalized.get("length")
+        elif str(raw_duration).isdigit():
+            raw_duration = None
+        seconds = _parse_timestamp(str(raw_duration or ""))
         if seconds:
             normalized["duration"] = seconds
     if not normalized.get("thumbnails") and (thumb := normalized.get("thumbnail")):
@@ -1283,6 +1366,16 @@ class YoutubeMusicFreeProvider(MusicProvider):
     # make one dict shared by every instance, so a populated account would make
     # a second, genuinely empty account raise a false partial-auth error.
     _library_seen_nonempty: dict[str, bool]
+    # These are likewise instance-only. In particular, a class-level cache
+    # would leak one account's resolutions into another provider instance.
+    _audio_replacement_cache: OrderedDict[
+        str, tuple[float, dict[str, Any] | None]
+    ]
+    _audio_replacement_inflight: dict[
+        str, asyncio.Task[tuple[dict[str, Any] | None, bool]]
+    ]
+    _audio_replacement_semaphore: asyncio.Semaphore
+    _audio_replacement_loop: asyncio.AbstractEventLoop
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return the config entries for this provider instance.
@@ -1307,6 +1400,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         await self._install_packages()
         await self._purge_legacy_auth_file()
         self._library_seen_nonempty = {}
+        self._ensure_audio_replacement_state()
         # Explicit None check: a plain `or True` would swallow a configured
         # False and pin every instance to the high-quality selector.
         prefer_quality = self.config.get_value(CONF_PREFER_AUDIO_QUALITY)
@@ -1666,6 +1760,257 @@ class YoutubeMusicFreeProvider(MusicProvider):
             "authorization": f"SAPISIDHASH {timestamp}_{sapisid_hash}",
         }
 
+    def _ensure_audio_replacement_state(self) -> None:
+        """Create this instance's bounded resolver state on the current loop."""
+        if "_audio_replacement_cache" not in self.__dict__:
+            self._audio_replacement_cache = OrderedDict()
+        loop = asyncio.get_running_loop()
+        if self.__dict__.get("_audio_replacement_loop") is not loop:
+            # Production uses one loop for the lifetime of an instance. The
+            # reset also makes direct method calls from separate asyncio.run
+            # invocations safe in tests and diagnostic scripts.
+            self._audio_replacement_loop = loop
+            self._audio_replacement_semaphore = asyncio.Semaphore(
+                AUDIO_REPLACEMENT_CONCURRENCY
+            )
+            self._audio_replacement_inflight = {}
+
+    def _get_cached_audio_replacement(
+        self, video_id: str
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Return ``(hit, value)`` so a cached negative remains distinguishable."""
+        cached = self._audio_replacement_cache.pop(video_id, None)
+        if cached is None:
+            return False, None
+        stored_at, value = cached
+        if time.monotonic() - stored_at >= AUDIO_REPLACEMENT_CACHE_TTL:
+            return False, None
+        self._audio_replacement_cache[video_id] = (stored_at, value)
+        return True, dict(value) if value is not None else None
+
+    def _cache_audio_replacement(
+        self, video_id: str, value: dict[str, Any] | None
+    ) -> None:
+        """Store a defensive copy and evict the least recently used entry."""
+        self._audio_replacement_cache.pop(video_id, None)
+        self._audio_replacement_cache[video_id] = (
+            time.monotonic(),
+            dict(value) if value is not None else None,
+        )
+        while len(self._audio_replacement_cache) > AUDIO_REPLACEMENT_CACHE_SIZE:
+            self._audio_replacement_cache.popitem(last=False)
+
+    async def _verified_atv_candidate(
+        self,
+        candidate: dict[str, Any],
+        *,
+        allow_unavailable: bool = False,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Return a usable ATV candidate and whether verification hit an error.
+
+        A typed, complete ATV needs no extra request. A missing type (or a
+        sparse typed counterpart) is checked through its own watch queue, and
+        only the entry whose id exactly matches the candidate can verify it.
+        Metadata is merged only between those two same-id representations.
+        """
+        video_id = candidate.get("videoId")
+        if not video_id or (
+            not allow_unavailable and candidate.get("isAvailable") is False
+        ):
+            return None, False
+        video_id = str(video_id)
+        video_type = candidate.get("videoType")
+        if video_type == VIDEO_TYPE_ATV and _usable_audio_metadata(candidate):
+            return dict(candidate), False
+        if video_type and video_type != VIDEO_TYPE_ATV:
+            return None, False
+
+        try:
+            watch_playlist = await asyncio.to_thread(
+                self._ytmusic.get_watch_playlist,
+                videoId=video_id,
+                limit=1,
+            )
+        except Exception as err:  # noqa: BLE001 - one candidate may fail alone
+            self.logger.debug("ATV type lookup failed for %s: %s", video_id, err)
+            return None, True
+
+        exact = next(
+            (
+                item
+                for item in (watch_playlist or {}).get("tracks") or []
+                if isinstance(item, dict) and str(item.get("videoId") or "") == video_id
+            ),
+            None,
+        )
+        if not exact or exact.get("videoType") != VIDEO_TYPE_ATV:
+            return None, False
+        merged = dict(candidate)
+        merged.update(exact)
+        merged["videoId"] = video_id
+        merged["videoType"] = VIDEO_TYPE_ATV
+        if not allow_unavailable and merged.get("isAvailable") is False:
+            return None, False
+        if not _usable_audio_metadata(merged):
+            return None, False
+        return merged, False
+
+    async def _resolve_preferred_audio_uncached(
+        self, track_obj: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Resolve one music item to ATV, returning ``(value, cacheable)``."""
+        async with self._audio_replacement_semaphore:
+            original = dict(track_obj)
+            original_id = str(original.get("videoId") or "")
+            had_error = False
+
+            # An explicitly typed ATV is already the desired recording. A
+            # sparse one still needs same-id hydration before the parser can
+            # safely consume it.
+            if original.get("videoType") == VIDEO_TYPE_ATV:
+                verified, error = await self._verified_atv_candidate(
+                    original, allow_unavailable=True
+                )
+                return verified, verified is not None or not error
+
+            # Songs search results often omit videoType. Verify the original
+            # itself first, otherwise an actual Art Track would be excluded
+            # from the fallback search merely because it has the same id.
+            if not original.get("videoType"):
+                verified, error = await self._verified_atv_candidate(
+                    original, allow_unavailable=True
+                )
+                had_error |= error
+                if verified is not None:
+                    return verified, True
+
+            counterpart = original.get("counterpart")
+            if isinstance(counterpart, dict) and counterpart.get("videoId"):
+                verified, error = await self._verified_atv_candidate(counterpart)
+                had_error |= error
+                if verified is not None:
+                    return verified, True
+
+            title = _audio_song_title(original.get("title") or "")
+            source_ids, source_names = _audio_artist_keys(original.get("artists"))
+            artists = original.get("artists") or []
+            first_artist = next(
+                (
+                    artist.get("name") or artist.get("artist")
+                    for artist in artists
+                    if isinstance(artist, dict)
+                    and (artist.get("name") or artist.get("artist"))
+                ),
+                "",
+            )
+            if not title or not first_artist or not source_names:
+                return None, not had_error
+
+            try:
+                candidates = await asyncio.to_thread(
+                    self._ytmusic.search,
+                    f"{first_artist} {title}".strip(),
+                    filter="songs",
+                    limit=AUDIO_REPLACEMENT_SEARCH_LIMIT,
+                )
+            except Exception as err:  # noqa: BLE001 - drop only this item
+                self.logger.debug("ATV search failed for %s: %s", original_id, err)
+                return None, False
+
+            checked = 0
+            title_key = _audio_text_key(title)
+            for candidate in (candidates or [])[:AUDIO_REPLACEMENT_SEARCH_LIMIT]:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_id = str(candidate.get("videoId") or "")
+                if (
+                    not candidate_id
+                    or candidate_id == original_id
+                    or candidate.get("isAvailable") is False
+                    or _audio_text_key(_audio_song_title(candidate.get("title") or ""))
+                    != title_key
+                ):
+                    continue
+                candidate_ids, candidate_names = _audio_artist_keys(
+                    candidate.get("artists")
+                )
+                if not (
+                    source_ids.intersection(candidate_ids)
+                    or source_names.intersection(candidate_names)
+                ):
+                    continue
+
+                checked += 1
+                verified, error = await self._verified_atv_candidate(candidate)
+                had_error |= error
+                if verified is not None:
+                    return verified, True
+                if checked >= AUDIO_REPLACEMENT_VERIFY_LIMIT:
+                    break
+            return None, not had_error
+
+    async def _resolve_preferred_audio(
+        self, track_obj: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Resolve one item with caching and duplicate in-flight coalescing."""
+        # Podcasts are a separate media domain. If one ever leaks into a watch
+        # queue, leave it exactly as the old path did rather than treating it as
+        # a failed music replacement.
+        if (
+            track_obj.get("videoType") == VIDEO_TYPE_PODCAST_EPISODE
+            or track_obj.get("resultType") == "podcast"
+        ):
+            return dict(track_obj)
+        video_id = str(track_obj.get("videoId") or "")
+        if not video_id:
+            return None
+
+        self._ensure_audio_replacement_state()
+        hit, cached = self._get_cached_audio_replacement(video_id)
+        if hit:
+            return cached
+
+        task = self._audio_replacement_inflight.get(video_id)
+        owner = task is None
+        if task is None:
+            task = asyncio.create_task(
+                self._resolve_preferred_audio_uncached(dict(track_obj))
+            )
+            self._audio_replacement_inflight[video_id] = task
+        try:
+            resolved, cacheable = await task
+        except Exception as err:  # noqa: BLE001 - never fail the whole result set
+            self.logger.debug("ATV resolution failed for %s: %s", video_id, err)
+            return None
+        finally:
+            if owner and self._audio_replacement_inflight.get(video_id) is task:
+                self._audio_replacement_inflight.pop(video_id, None)
+
+        if cacheable:
+            self._cache_audio_replacement(video_id, resolved)
+        return dict(resolved) if resolved is not None else None
+
+    async def _resolve_preferred_audio_batch(
+        self, items: list[tuple[str, dict[str, Any]]]
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Resolve and deduplicate raw items while retaining their source pass."""
+        if not items:
+            return []
+        resolved = await asyncio.gather(
+            *(self._resolve_preferred_audio(item) for _, item in items)
+        )
+        output: list[tuple[str, dict[str, Any]]] = []
+        seen_ids: set[str] = set()
+        for (source, _), candidate in zip(items, resolved, strict=True):
+            if candidate is None:
+                continue
+            video_id = str(candidate.get("videoId") or "")
+            if not video_id or video_id in seen_ids:
+                continue
+            seen_ids.add(video_id)
+            output.append((source, candidate))
+        return output
+
     async def search(
         self,
         search_query: str,
@@ -1736,11 +2081,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         # slice reserved for videos, is the only place that can be done.
         song_tracks: list[Track] = []
         video_tracks: list[Track] = []
-        # YTM keeps a song and its music video as distinct ids, so this set
-        # should never fire across the songs/videos passes; it guards against
-        # the backend handing out a counterpart id twice, which it has done
-        # elsewhere (ytmusicapi #739).
-        seen_track_ids: set[str] = set()
+        raw_track_results: list[tuple[str, dict[str, Any]]] = []
         for ytm_filter, result in results:
             try:
                 result_type = result.get("resultType")
@@ -1762,16 +2103,26 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     # podcast episodes it returns; those belong to the podcast
                     # domain, not in track results.
                     and result.get("videoType") != VIDEO_TYPE_PODCAST_EPISODE
-                    and (track := self._parse_track(result))
-                    and track.item_id not in seen_track_ids
                 ):
-                    seen_track_ids.add(track.item_id)
-                    if ytm_filter == SEARCH_FILTER_VIDEOS:
-                        video_tracks.append(track)
-                    else:
-                        song_tracks.append(track)
+                    raw_track_results.append((ytm_filter, result))
             except (InvalidDataError, KeyError, TypeError):
                 pass  # skip invalid items
+
+        # Resolve before parsing so the replacement id, duration, artwork and
+        # album all come from the same ATV object. The batch also deduplicates
+        # after replacement: a song and its music video commonly converge on
+        # one Art Track id.
+        for ytm_filter, result in await self._resolve_preferred_audio_batch(
+            raw_track_results
+        ):
+            try:
+                track = self._parse_track(_normalize_watch_track(result))
+            except (InvalidDataError, KeyError, TypeError):
+                continue
+            if ytm_filter == SEARCH_FILTER_VIDEOS:
+                video_tracks.append(track)
+            else:
+                song_tracks.append(track)
 
         # Catalog songs first, videos below them, together at most `limit`.
         # The reservation shrinks to what the videos pass actually returned,
@@ -2354,7 +2705,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         )
         return None
 
-    async def _get_radio_playlist_tracks(self, playlist_id: str) -> list[Track]:
+    async def _get_radio_playlist_tracks(self, playlist_id: str) -> list[Track] | None:
         """Return the tracks of a personal mix or song radio.
 
         The watch/radio endpoint is what YouTube Music itself uses for these,
@@ -2366,6 +2717,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
         Not for editorial ``RDCLAK5uy_`` playlists. This endpoint will answer
         for those too, but only with a queue's worth, so they keep the ordinary
         path and its full track list. See ``_is_watch_only_playlist_id``.
+
+        ``None`` means the endpoint failed or returned no raw tracks, so the
+        caller may try its legacy playlist fallback. An empty list means the
+        endpoint succeeded but every item was deliberately removed (for
+        example, no confident ATV existed); falling back in that case would
+        reintroduce the very videos this path filtered out.
         """
         bare_id = _strip_browse_prefix(playlist_id)
         try:
@@ -2378,23 +2735,35 @@ class YoutubeMusicFreeProvider(MusicProvider):
             self.logger.warning(
                 "get_watch_playlist failed for mix %s: %s", playlist_id, err
             )
-            return []
+            return None
 
         tracks_raw = (watch_playlist or {}).get("tracks") or []
+        if not tracks_raw:
+            self.logger.warning("mix %s returned no raw tracks", playlist_id)
+            return None
+        resolved_raw = await self._resolve_preferred_audio_batch(
+            [
+                ("watch", track_obj)
+                for track_obj in tracks_raw
+                if isinstance(track_obj, dict)
+            ]
+        )
         result = []
-        for index, track_obj in enumerate(tracks_raw, 1):
+        for _, track_obj in resolved_raw:
             with suppress(InvalidDataError, KeyError, TypeError):
                 track = self._parse_track(_normalize_watch_track(track_obj))
                 if track:
-                    track.position = index
                     result.append(track)
+        result = self._drop_ai_tracks(result, f"mix {playlist_id}")
+        for index, track in enumerate(result, 1):
+            track.position = index
         if not result:
             self.logger.warning(
                 "mix %s returned no usable tracks (%d raw entries)",
                 playlist_id,
                 len(tracks_raw),
             )
-        return self._drop_ai_tracks(result, f"mix {playlist_id}")
+        return result
 
     @use_cache(PLAYLIST_TRACKS_CACHE_TTL, allow_expired_cache=True)
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
@@ -2428,7 +2797,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
         # playlist after all.
         watch_first = _is_watch_only_playlist_id(prov_playlist_id)
         if watch_first:
-            if radio_tracks := await self._get_radio_playlist_tracks(prov_playlist_id):
+            radio_tracks = await self._get_radio_playlist_tracks(prov_playlist_id)
+            if radio_tracks is not None:
                 return radio_tracks
         try:
             playlist_obj = await asyncio.to_thread(
@@ -2501,7 +2871,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
             # read may still answer there. Watch-only ids already tried it
             # above, so this never repeats that call.
             if not watch_first and _is_radio_playlist_id(prov_playlist_id):
-                if radio_tracks := await self._get_radio_playlist_tracks(prov_playlist_id):
+                radio_tracks = await self._get_radio_playlist_tracks(prov_playlist_id)
+                if radio_tracks is not None:
                     return radio_tracks
             return await self._get_playlist_tracks_via_ytdlp(prov_playlist_id)
 
@@ -2709,8 +3080,15 @@ class YoutubeMusicFreeProvider(MusicProvider):
             return []
         if not watch_playlist or "tracks" not in watch_playlist:
             return []
+        resolved_raw = await self._resolve_preferred_audio_batch(
+            [
+                ("watch", track_obj)
+                for track_obj in watch_playlist["tracks"]
+                if isinstance(track_obj, dict)
+            ]
+        )
         tracks = []
-        for track_obj in watch_playlist["tracks"]:
+        for _, track_obj in resolved_raw:
             with suppress(InvalidDataError, KeyError, TypeError):
                 # Same reshaping as the mix path: this endpoint reports duration
                 # as a clock string and artwork under a differently named key.

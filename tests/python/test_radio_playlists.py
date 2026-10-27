@@ -166,7 +166,7 @@ def _watch_track(video_id="vid1", length="3:32"):
             {"url": "https://i.ytimg.com/vi/x/hq720.jpg?sqp=b", "width": 800, "height": 450},
             {"url": "https://i.ytimg.com/vi/x/hq720.jpg?sqp=c", "width": 853, "height": 479},
         ],
-        "videoType": "MUSIC_VIDEO_TYPE_OMV",
+        "videoType": "MUSIC_VIDEO_TYPE_ATV",
     }
 
 
