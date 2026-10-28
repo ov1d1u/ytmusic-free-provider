@@ -1,6 +1,6 @@
 name: Build and Publish Docker Images
 
-# Builds the Music Assistant + ytmusic_free provider image. Official
+# Builds the Music Assistant image with both repository providers. Official
 # releases and automatic (untested) builds use strictly separated tags:
 #
 # Official releases (via release.yml, considered TESTED):
@@ -47,6 +47,7 @@ on:
     branches: [ "main" ]
     paths:
       - 'ytmusic_free/**'
+      - 'soulseek/**'
       - 'Dockerfile'
       - '.dockerignore'
       - '.github/workflows/docker-publish.yml'

@@ -48,7 +48,7 @@ fi
 # Last commit that touched anything the image build consumes. Stamped as the
 # revision annotation and used for the skip comparison, so docs-only commits
 # no longer force a rebuild of the channel variants.
-LAST_BUILD_COMMIT="$(git log -1 --format=%H -- ytmusic_free Dockerfile .dockerignore)"
+LAST_BUILD_COMMIT="$(git log -1 --format=%H -- ytmusic_free soulseek Dockerfile .dockerignore)"
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -228,7 +228,7 @@ for variant in edge beta nightly; do
   fi
 done
 
-MATRIX="$(jq -nc --argjson include "$legs" '{include: $include}')"
+MATRIX="$(jq -nc --argjson entries "$legs" '{"include": $entries}')"
 emit "matrix" "$MATRIX"
 emit "unresolved" "${unresolved[*]}"
 if [ "$legs" = "[]" ]; then

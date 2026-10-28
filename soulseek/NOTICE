@@ -1,0 +1,6 @@
+The provider artwork and parts of the integration design were derived from
+Sonosano by KRSHH (https://github.com/KRSHH/Sonosano), licensed under the
+Apache License 2.0.
+
+Nicotine+ is an external runtime dependency licensed under GPL-3.0-or-later.
+Its source is not copied into this MIT-licensed repository.

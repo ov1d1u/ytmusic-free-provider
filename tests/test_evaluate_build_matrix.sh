@@ -203,7 +203,7 @@ assert_eq "exit status" 0 "$RC"
 assert_eq "builds all three" "has_builds=true variants=edge,beta,nightly tags=$E;$B;$N unresolved=-" "$RESULT"
 assert_eq "base channel and revision per leg" "ma=latest,beta,nightly rev=$HEAD_SHA" "$DETAILS"
 assert_eq "revision comes from the build inputs only" 1 \
-    "$(grep -c '^git log -1 --format=%H -- ytmusic_free Dockerfile .dockerignore$' "$CASE_DIR/calls.log")"
+    "$(grep -c '^git log -1 --format=%H -- ytmusic_free soulseek Dockerfile .dockerignore$' "$CASE_DIR/calls.log")"
 
 new_case s2 "schedule, everything current (index annotations)"
 publish_all_current

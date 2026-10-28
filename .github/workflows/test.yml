@@ -41,6 +41,7 @@ jobs:
           shellcheck -s sh scripts/install_watcher_addon.sh
           shellcheck -s sh tests/test_install_watcher_addon.sh
           shellcheck -s sh scripts/install_provider.sh
+          shellcheck -s sh scripts/install_soulseek_provider.sh
           shellcheck -s sh tests/test_install_provider.sh
           # bash syntax: the script uses bash-only features (associative
           # arrays, substring expansion) and runs under the GitHub runner's
@@ -91,10 +92,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # 3.13 matches the Python version Music Assistant currently ships in
-        # its container. 3.11 is the lowest version the model classes have
-        # historically supported, so we cover the floor too.
-        python-version: ["3.11", "3.13"]
+        # Cover the historical floor plus the current and previous server
+        # interpreter generations.
+        python-version: ["3.11", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
 
@@ -116,13 +116,16 @@ jobs:
     # depends on (tests/ma_contract.py). It is the half of that contract the
     # stubbed suite structurally cannot verify.
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install the real music_assistant_models
         run: |
@@ -178,14 +181,16 @@ jobs:
           # exists in the site-packages path resolved via Python itself.
           # We use --entrypoint sh to override the default "mass" entrypoint.
           docker run --rm --entrypoint sh local-test-image:${{ matrix.ma_version }} -c '
-            TARGET_DIR="$( /app/venv/bin/python -c "import sysconfig; print(sysconfig.get_path(\"purelib\"))" )/music_assistant/providers/ytmusic_free"
-            echo "Checking path: $TARGET_DIR"
-            if [ -d "$TARGET_DIR" ] && [ -f "$TARGET_DIR/manifest.json" ]; then
-              echo "Success: Provider files verified in venv."
-            else
-              echo "Error: Provider files missing from expected site-packages path!" >&2
-              exit 1
-            fi
+            PROVIDERS_DIR="$( /app/venv/bin/python -c "import sysconfig; print(sysconfig.get_path(\"purelib\"))" )/music_assistant/providers"
+            for PROVIDER in ytmusic_free soulseek; do
+              TARGET_DIR="$PROVIDERS_DIR/$PROVIDER"
+              echo "Checking path: $TARGET_DIR"
+              if [ ! -d "$TARGET_DIR" ] || [ ! -f "$TARGET_DIR/manifest.json" ]; then
+                echo "Error: $PROVIDER files missing from expected site-packages path!" >&2
+                exit 1
+              fi
+            done
+            echo "Success: Both provider directories verified in venv."
           '
 
       - name: Assert the provider imports against real Music Assistant

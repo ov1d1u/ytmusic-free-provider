@@ -59,6 +59,8 @@ def _install_music_assistant_models() -> None:
         depends_on: str | None = None
         depends_on_value: list | None = None
         description: str | None = None
+        range: tuple[int, int] | None = None
+        advanced: bool = False
 
     @dataclass
     class _ProviderError:
@@ -146,6 +148,7 @@ def _install_music_assistant_models() -> None:
     class _StreamType(str, Enum):
         HTTP = "http"
         CUSTOM = "custom"
+        LOCAL_FILE = "local_file"
 
     class _EventType(str, Enum):
         PROVIDERS_UPDATED = "providers_updated"

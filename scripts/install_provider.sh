@@ -1,17 +1,18 @@
 #!/bin/sh
-# Install the ytmusic_free provider into the running Music Assistant container.
+# Install a provider from this repository into Music Assistant.
 #
 # Portable across HAOS (BusyBox ash) and Supervised installs. Uses curl + tar
 # instead of git so it runs on HAOS, where git is not available.
 #
 # Usage:
-#   sh install_provider.sh [--force] [--repo-owner OWNER] [--ref REF] [--ma-id ID]
+#   sh install_provider.sh [--provider ytmusic_free|soulseek] [--force]
+#                          [--repo-owner OWNER] [--ref REF] [--ma-id ID]
 #                          [--python-version VER] [--config-dir DIR]
 #                          [--no-restart] [--no-stage]
 #
 # What it does:
-#   1. Downloads ytmusic_free/ from the repository at the requested ref.
-#   2. Stages it at /config/custom_components/mass/providers/ytmusic_free
+#   1. Downloads the selected provider from the requested repository ref.
+#   2. Stages it below /config/custom_components/mass/providers/
 #      (persistent location used by the watcher add-on).
 #   3. Copies it into the live MA container at
 #      /app/venv/lib/<pythonX.Y>/site-packages/music_assistant/providers/.
@@ -25,6 +26,7 @@ set -eu
 REPO_OWNER="sproft"
 REPO_NAME="ytmusic-free-provider"
 PROVIDER_DIR="ytmusic_free"
+PROVIDER_NAME="YouTube Music (Free)"
 
 # Empty means "resolve the newest published release". --ref overrides it with a
 # branch, tag or commit. Installing a release rather than branch head is what
@@ -105,6 +107,8 @@ Usage: sh install_provider.sh [options]
 
 Options:
   --force, -f               Skip overwrite prompts
+  --provider NAME           Provider directory: ytmusic_free or soulseek
+                            (default: ytmusic_free)
   --repo-owner OWNER        Repository owner (default: sproft)
   --ref REF                 Git ref (branch/tag/commit) to download
                             (default: the newest published release; use
@@ -122,6 +126,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --force|-f) FORCE=1 ;;
+        --provider) shift; PROVIDER_DIR="${1:-}" ;;
         --repo-owner) shift; REPO_OWNER="${1:-}" ;;
         --ref) shift; REF="${1:-}" ;;
         --ma-id) shift; MA_ID="${1:-}" ;;
@@ -134,6 +139,12 @@ while [ $# -gt 0 ]; do
     esac
     shift || true
 done
+
+case "$PROVIDER_DIR" in
+    ytmusic_free) PROVIDER_NAME="YouTube Music (Free)" ;;
+    soulseek) PROVIDER_NAME="Soulseek" ;;
+    *) die "unsupported provider '$PROVIDER_DIR' (expected ytmusic_free or soulseek)" ;;
+esac
 
 # URL of this script, used in re-run hints so they are copy-pasteable. Honors
 # --repo-owner / --ref, and (crucially) shows the "sh -s --" pipe form: the
@@ -325,6 +336,24 @@ docker cp "$SRC_ROOT/$PROVIDER_DIR" "$MA_ID:$DST_DIR/" \
     || die "docker cp failed. Is the MA container running?"
 log "Provider files copied OK"
 
+# Nicotine+'s headless core is enough for the provider. Avoid pulling its GTK
+# desktop dependency into the Music Assistant container.
+if [ "$PROVIDER_DIR" = "soulseek" ]; then
+    log "Installing pinned Soulseek dependency..."
+    if docker exec "$MA_ID" test -x /app/venv/bin/uv; then
+        docker exec "$MA_ID" /app/venv/bin/uv pip install \
+            --python /app/venv/bin/python --no-cache --no-deps \
+            "nicotine-plus==3.3.11" \
+            || die "failed to install nicotine-plus==3.3.11"
+    elif docker exec "$MA_ID" test -x /app/venv/bin/pip; then
+        docker exec "$MA_ID" /app/venv/bin/pip install --no-cache-dir --no-deps \
+            "nicotine-plus==3.3.11" \
+            || die "failed to install nicotine-plus==3.3.11"
+    else
+        die "Music Assistant contains neither uv nor pip; cannot install Soulseek dependencies"
+    fi
+fi
+
 # --- Restart MA -------------------------------------------------------------
 
 if [ "$NO_RESTART" -ne 1 ]; then
@@ -338,6 +367,7 @@ fi
 
 # --- Done -------------------------------------------------------------------
 
+if [ "$PROVIDER_DIR" = "ytmusic_free" ]; then
 cat <<EOF
 
 Install complete.
@@ -354,3 +384,20 @@ Re-run anytime to upgrade (pass --force so the overwrite prompt does not stall a
 curl-pipe run). If autodetect picked wrong values, override with:
   curl -fsSL $SCRIPT_URL | sh -s -- --force --ma-id <ID> --python-version <pythonX.Y>
 EOF
+else
+cat <<EOF
+
+Install complete.
+
+Next steps:
+  1. Open Music Assistant -> Settings -> Music sources -> Add
+     and select "$PROVIDER_NAME".
+  2. Review SOULSEEK_PROVIDER.md, especially its networking, storage, privacy,
+     and peer-to-peer legality notes.
+  3. Re-run this installer after a Music Assistant add-on update recreates its
+     container; the YouTube provider watcher does not inject Soulseek.
+
+Re-run anytime to upgrade:
+  curl -fsSL $SCRIPT_URL | sh -s -- --provider soulseek --force --ma-id <ID> --python-version <pythonX.Y>
+EOF
+fi

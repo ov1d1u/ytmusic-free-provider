@@ -14,6 +14,7 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/install_provider.sh"
+SOULSEEK_SCRIPT="$REPO_ROOT/scripts/install_soulseek_provider.sh"
 
 PASS=0
 FAIL=0
@@ -58,6 +59,7 @@ assert_file_exists() {
 printf '\n== Script structure ==\n'
 
 assert_file_exists "installer script exists" "$SCRIPT"
+assert_file_exists "Soulseek convenience installer exists" "$SOULSEEK_SCRIPT"
 
 shebang="$(head -n1 "$SCRIPT")"
 assert_eq "shebang is POSIX sh" "#!/bin/sh" "$shebang"
@@ -66,6 +68,12 @@ if sh -n "$SCRIPT" 2>/dev/null; then
     pass "POSIX sh -n syntax check"
 else
     fail "POSIX sh -n syntax check"
+fi
+
+if sh -n "$SOULSEEK_SCRIPT" 2>/dev/null; then
+    pass "Soulseek wrapper POSIX sh -n syntax check"
+else
+    fail "Soulseek wrapper POSIX sh -n syntax check"
 fi
 
 # Bashisms guard (best-effort; not exhaustive). Skips comment lines.
@@ -131,6 +139,9 @@ fi
 # with "sh: bad option" (issue #35). Guard the fix against regressing.
 src="$(cat "$SCRIPT")"
 assert_contains "re-run hints use the sh -s -- separator" "sh -s --" "$src"
+assert_contains "installer supports the Soulseek provider" "soulseek)" "$src"
+assert_contains "Soulseek dependency is exactly pinned" \
+    "nicotine-plus==3.3.11" "$src"
 
 # --- Release-tracking install (issue #68) ------------------------------------
 #
@@ -175,6 +186,7 @@ help_out="$(sh "$SCRIPT" --help 2>&1)"; help_rc=$?
 assert_eq "--help exits 0" "0" "$help_rc"
 assert_contains "--help prints Usage:" "Usage:" "$help_out"
 assert_contains "--help mentions --force" "--force" "$help_out"
+assert_contains "--help mentions --provider" "--provider" "$help_out"
 assert_contains "--help mentions --ref" "--ref" "$help_out"
 assert_contains "--help mentions --ma-id" "--ma-id" "$help_out"
 assert_contains "--help mentions --python-version" "--python-version" "$help_out"

@@ -1,0 +1,11 @@
+{
+  "type": "music",
+  "domain": "soulseek",
+  "stage": "experimental",
+  "name": "Soulseek",
+  "description": "Browse the MusicBrainz catalog and play matching FLAC or MP3 files found through Soulseek.",
+  "codeowners": ["sproft"],
+  "documentation": "https://github.com/sproft/ytmusic-free-provider/blob/main/SOULSEEK_PROVIDER.md",
+  "requirements": ["nicotine-plus==3.3.11"],
+  "multi_instance": false
+}

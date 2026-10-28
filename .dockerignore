@@ -1,2 +1,5 @@
 *
 !ytmusic_free
+!soulseek
+**/__pycache__
+**/*.pyc

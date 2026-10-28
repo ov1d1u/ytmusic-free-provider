@@ -70,7 +70,7 @@ jobs:
           # column 0. Plain -v renders skips mid-line, which that grep misses.
           for attempt in 1 2; do
             echo "::group::attempt $attempt"
-            if python -m pytest tests/python -m live -v -rs 2>&1 | tee live.log; then
+            if python -m pytest tests/python -m "live and not musicbrainz" -v -rs 2>&1 | tee live.log; then
               echo "::endgroup::"
               exit 0
             fi
@@ -149,3 +149,22 @@ jobs:
         run: |
           echo "::error title=Anonymous extraction or playback failed::yt-dlp could not resolve a usable audio stream for any known video, or the resolved url did not serve bytes, after a retry. See the job summary for what to check."
           exit 1
+
+  musicbrainz:
+    name: MusicBrainz API canary (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Check the live MusicBrainz JSON contract
+        run: python -m pytest tests/python -m musicbrainz -v

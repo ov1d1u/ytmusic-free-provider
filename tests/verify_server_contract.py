@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import inspect
 import re
+from importlib.metadata import version
 
 # Parameters of ``music_assistant.controllers.cache.use_cache`` that the provider
 # passes. It decorates twelve methods, every one of them as
@@ -69,6 +70,7 @@ _FEATURE_GATE = re.compile(
 
 def main() -> None:
     """Import the provider for real, then check what the import cannot prove."""
+    import music_assistant.providers.soulseek as soulseek_provider
     import music_assistant.providers.ytmusic_free as provider
 
     # That import is most of the contract on its own, and it is worth being
@@ -80,6 +82,25 @@ def main() -> None:
     # imports: infer_album_type, install_package, parse_title_and_version and
     # MusicProvider.
     print(f"provider imported from {provider.__file__}")
+    print(f"soulseek provider imported from {soulseek_provider.__file__}")
+
+    import pynicotine.core
+
+    if version("nicotine-plus") != "3.3.11":
+        raise SystemExit("Soulseek requires nicotine-plus==3.3.11")
+    entries = {entry.key: entry for entry in soulseek_provider._build_config_entries()}
+    expected_entries = {"audio_quality", "listen_port", "cache_limit_gb"}
+    if set(entries) != expected_entries:
+        raise SystemExit(f"Unexpected Soulseek settings: {set(entries)!r}")
+    if entries["audio_quality"].default_value != "mp3":
+        raise SystemExit("Soulseek audio quality no longer defaults to MP3")
+    if entries["listen_port"].range != (1024, 65535):
+        raise SystemExit("Soulseek listen-port validation range changed")
+    if entries["cache_limit_gb"].default_value != 5:
+        raise SystemExit("Soulseek cache no longer defaults to 5 GB")
+    if entries["cache_limit_gb"].range != (1, 1000):
+        raise SystemExit("Soulseek cache validation range changed")
+    print(f"soulseek dependency and config contract ok: {type(pynicotine.core).__name__}")
 
     from music_assistant.controllers.cache import BYPASS_CACHE, use_cache
 

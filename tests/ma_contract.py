@@ -195,11 +195,9 @@ REQUIRED_STREAM_DETAILS_FIELDS: tuple[str, ...] = (
     "data",
 )
 
-# ``StreamType`` members the provider names. CUSTOM is the one playback stands
-# on: googlevideo refuses the unbounded fetches ffmpeg makes (bounded-Range
-# enforcement, 2026-08), so the provider streams the audio itself through
-# ``get_audio_stream``, and that hook is only ever called for CUSTOM.
-REQUIRED_STREAM_TYPE_MEMBERS: tuple[str, ...] = ("CUSTOM",)
+# ``StreamType`` members the providers name. CUSTOM drives progressive remote
+# playback; LOCAL_FILE lets completed Soulseek downloads replay seekably.
+REQUIRED_STREAM_TYPE_MEMBERS: tuple[str, ...] = ("CUSTOM", "LOCAL_FILE")
 
 # Names for "this url is not fetchable until T". Upstream has none of them, and
 # that absence is load-bearing: it is why the provider sits out YouTube's
