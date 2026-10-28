@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from music_assistant_models.errors import SetupFailedError
 
-from soulseek.cache import DownloadCache
+from soulseek.storage import RuntimeStorage
 from soulseek.client import DownloadHandle, SoulseekClient
 from soulseek.ranking import PeerFile
 
@@ -85,6 +85,7 @@ class DummyCore:
 
     def init_components(self, components, isolated_mode):
         self.components = components
+        self.enabled_components = components
         self.isolated_mode = isolated_mode
 
     def start(self):
@@ -130,12 +131,13 @@ def patch_nicotine(monkeypatch, *, login_success=True, reason=""):
             "pynicotine.slskmessages": SimpleNamespace(FileListMessage=DummySearch),
         }[name]
 
+    monkeypatch.setattr(client_module, "create_memory_downloads", lambda client: core.downloads)
     monkeypatch.setattr(client_module.importlib, "import_module", fake_import)
     return core, config, events
 
 
-async def initialized_cache(tmp_path: Path) -> DownloadCache:
-    cache = DownloadCache(tmp_path / "soulseek")
+async def initialized_cache(tmp_path: Path) -> RuntimeStorage:
+    cache = RuntimeStorage(tmp_path / "soulseek")
     await cache.initialize()
     return cache
 
@@ -149,7 +151,7 @@ def test_successful_login_persists_stable_credentials_and_disables_sharing(
         cache = await initialized_cache(tmp_path)
         client = SoulseekClient(
             loop=asyncio.get_running_loop(),
-            cache=cache,
+            storage=cache,
             listen_port=3456,
             logger=SimpleNamespace(warning=lambda *args: None),
         )
@@ -169,7 +171,7 @@ def test_successful_login_persists_stable_credentials_and_disables_sharing(
         _core2, config2, _events2 = patch_nicotine(monkeypatch)
         second_client = SoulseekClient(
             loop=asyncio.get_running_loop(),
-            cache=cache,
+            storage=cache,
             listen_port=3456,
             logger=SimpleNamespace(warning=lambda *args: None),
         )
@@ -193,7 +195,7 @@ def test_failed_login_including_port_conflict_does_not_persist_credentials(
         cache = await initialized_cache(tmp_path)
         client = SoulseekClient(
             loop=asyncio.get_running_loop(),
-            cache=cache,
+            storage=cache,
             listen_port=2234,
             logger=SimpleNamespace(warning=lambda *args: None),
         )
@@ -211,7 +213,7 @@ def test_search_responses_are_isolated_by_token_and_malformed_rows_are_ignored(
         cache = await initialized_cache(tmp_path)
         client = SoulseekClient(
             loop=asyncio.get_running_loop(),
-            cache=cache,
+            storage=cache,
             listen_port=2234,
             logger=SimpleNamespace(warning=lambda *args: None),
         )
@@ -265,14 +267,12 @@ def test_search_responses_are_isolated_by_token_and_malformed_rows_are_ignored(
     asyncio.run(run())
 
 
-def test_abort_clears_transfer_and_removes_only_incomplete_file(tmp_path):
+def test_abort_clears_transfer_and_releases_memory(tmp_path):
     async def run():
         cache = await initialized_cache(tmp_path)
-        incomplete = cache.incomplete_path / "candidate.mp3"
-        incomplete.write_bytes(b"partial")
         client = SoulseekClient(
             loop=asyncio.get_running_loop(),
-            cache=cache,
+            storage=cache,
             listen_port=2234,
             logger=SimpleNamespace(warning=lambda *args: None),
         )
@@ -281,15 +281,70 @@ def test_abort_clears_transfer_and_removes_only_incomplete_file(tmp_path):
         transfer = SimpleNamespace()
         handle = DownloadHandle(
             peer_file=PeerFile("peer", "candidate.mp3", extension="mp3"),
-            folder=cache.downloads_path,
-            context={},
             transfer=transfer,
-            path=str(incomplete),
         )
+        from soulseek.memory import AudioBuffer
+        handle.buffer = AudioBuffer(lambda: None)
+        handle.buffer.write(b"partial")
         client._handles[client._handle_key("peer", "candidate.mp3")] = handle
         await client.abort_download(handle)
-        assert not incomplete.exists()
+        assert len(handle.buffer) == 0
         assert client._core.downloads.aborted
         assert client._core.downloads.cleared
 
+    asyncio.run(run())
+
+
+def test_shared_transfer_lives_until_last_consumer_releases_it(tmp_path):
+    async def run():
+        storage = await initialized_cache(tmp_path)
+        client = SoulseekClient(loop=asyncio.get_running_loop(), storage=storage,
+                                listen_port=2234, logger=SimpleNamespace(debug=lambda *args: None))
+        downloads = DummyDownloads()
+        def enqueue(username, path, **kwargs):
+            downloads.transfers[username + path] = SimpleNamespace(
+                username=username, virtual_path=path, status="Queued")
+        downloads.enqueue_download = enqueue
+        client._core = SimpleNamespace(downloads=downloads)
+        client._transfer_status = Status
+        peer = PeerFile("peer", "song.mp3", 100, "mp3")
+        first, second = await asyncio.gather(client.start_download(peer), client.start_download(peer))
+        assert first is second
+        first.buffer.write(b"audio")
+        await client.abort_download(first)
+        assert not downloads.aborted
+        assert second.buffer.read(0, 100) == b"audio"
+        await client.abort_download(second)
+        assert len(downloads.aborted) == 1
+        assert len(first.buffer) == 0
+        assert not client._handles
+    asyncio.run(run())
+
+
+def test_cancellation_during_enqueue_cleans_up_transfer(tmp_path):
+    import threading
+
+    async def run():
+        client = SoulseekClient(loop=asyncio.get_running_loop(),
+                                storage=await initialized_cache(tmp_path),
+                                listen_port=2234, logger=SimpleNamespace(debug=lambda *args: None))
+        entered = asyncio.Event()
+        proceed = threading.Event()
+        downloads = DummyDownloads()
+        def enqueue(username, path, **kwargs):
+            client.loop.call_soon_threadsafe(entered.set)
+            assert proceed.wait(2)
+            downloads.transfers[username + path] = SimpleNamespace(
+                username=username, virtual_path=path, status="Queued")
+        downloads.enqueue_download = enqueue
+        client._core = SimpleNamespace(downloads=downloads)
+        client._transfer_status = Status
+        pending = asyncio.create_task(client.start_download(PeerFile("peer", "song.mp3", 10, "mp3")))
+        await asyncio.wait_for(entered.wait(), 2)
+        pending.cancel()
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert len(downloads.aborted) == 1
+        assert not client._handles
     asyncio.run(run())

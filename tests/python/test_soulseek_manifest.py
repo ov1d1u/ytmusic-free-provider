@@ -20,17 +20,13 @@ def test_soulseek_manifest_is_single_instance_and_pins_dependencies():
     assert manifest["requirements"] == ["nicotine-plus==3.3.11"]
 
 
-def test_config_defaults_are_mp3_port_2234_and_five_gb_cache():
+def test_config_defaults_are_mp3_port_2234_without_disk_cache():
     entries = {entry.key: entry for entry in soulseek._build_config_entries()}
     assert entries[soulseek.CONF_AUDIO_QUALITY].default_value == "mp3"
     assert set(entries) == {
         soulseek.CONF_AUDIO_QUALITY,
         soulseek.CONF_LISTEN_PORT,
-        soulseek.CONF_CACHE_LIMIT_GB,
     }
     assert entries[soulseek.CONF_LISTEN_PORT].default_value == 2234
     assert entries[soulseek.CONF_LISTEN_PORT].advanced is True
     assert entries[soulseek.CONF_LISTEN_PORT].range == (1024, 65535)
-    assert entries[soulseek.CONF_CACHE_LIMIT_GB].default_value == 5
-    assert entries[soulseek.CONF_CACHE_LIMIT_GB].advanced is True
-    assert entries[soulseek.CONF_CACHE_LIMIT_GB].range == (1, 1000)

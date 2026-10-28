@@ -43,10 +43,10 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 
-from .cache import DownloadCache
 from .client import DownloadHandle, SoulseekClient
 from .musicbrainz import MusicBrainzClient, MusicBrainzItem
 from .ranking import diversify_peers, rank_variants
+from .storage import RuntimeStorage
 
 if TYPE_CHECKING:
     from music_assistant import MusicAssistant
@@ -57,13 +57,9 @@ if TYPE_CHECKING:
 
 CONF_AUDIO_QUALITY = "audio_quality"
 CONF_LISTEN_PORT = "listen_port"
-CONF_CACHE_LIMIT_GB = "cache_limit_gb"
 QUALITY_STANDARD = "mp3"
 QUALITY_HIGH = "flac"
 DEFAULT_LISTEN_PORT = 2234
-DEFAULT_CACHE_LIMIT_GB = 5
-MIN_CACHE_LIMIT_GB = 1
-MAX_CACHE_LIMIT_GB = 1000
 FIRST_BYTE_TIMEOUT = 20
 MIDSTREAM_STALL_TIMEOUT = 20
 STREAM_CHUNK_SIZE = 64 * 1024
@@ -118,17 +114,6 @@ def _build_config_entries() -> tuple[ConfigEntry, ...]:
             advanced=True,
             description="TCP listen port used by the embedded headless Nicotine+ core.",
         ),
-        ConfigEntry(
-            key=CONF_CACHE_LIMIT_GB,
-            type=ConfigEntryType.INTEGER,
-            label="Download cache limit (GB)",
-            default_value=DEFAULT_CACHE_LIMIT_GB,
-            required=True,
-            range=(MIN_CACHE_LIMIT_GB, MAX_CACHE_LIMIT_GB),
-            advanced=True,
-            description="Maximum space for completed Soulseek downloads. Oldest "
-            "completed tracks are removed first; active downloads are never evicted.",
-        ),
     )
 
 
@@ -136,7 +121,7 @@ class SoulseekProvider(MusicProvider):
     """MusicBrainz metadata with peer-to-peer Soulseek playback."""
 
     _catalog: MusicBrainzClient
-    _cache: DownloadCache
+    _storage: RuntimeStorage
     _client: SoulseekClient
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
@@ -161,31 +146,15 @@ class SoulseekProvider(MusicProvider):
             raise InvalidDataError(
                 "Soulseek listen port must be between 1024 and 65535"
             )
-        try:
-            cache_limit_gb = int(
-                self.config.get_value(CONF_CACHE_LIMIT_GB) or DEFAULT_CACHE_LIMIT_GB
-            )
-        except (TypeError, ValueError) as err:
-            raise InvalidDataError("Download cache limit must be a number") from err
-        if not MIN_CACHE_LIMIT_GB <= cache_limit_gb <= MAX_CACHE_LIMIT_GB:
-            raise InvalidDataError(
-                f"Download cache limit must be between {MIN_CACHE_LIMIT_GB} and "
-                f"{MAX_CACHE_LIMIT_GB} GB"
-            )
-
         self._quality = quality
-        self._cache = DownloadCache(
-            Path(self.mass.storage_path) / "soulseek",
-            cache_limit_gb * 1024**3,
-        )
-        await self._cache.initialize()
+        self._storage = RuntimeStorage(Path(self.mass.storage_path) / "soulseek")
+        await self._storage.initialize()
         self._catalog = MusicBrainzClient(self.mass, self.instance_id)
         self._client = SoulseekClient(
             loop=asyncio.get_running_loop(),
-            cache=self._cache,
+            storage=self._storage,
             listen_port=listen_port,
             logger=self.logger,
-            on_download_complete=self._on_download_complete,
         )
         await self._client.start()
 
@@ -348,22 +317,6 @@ class SoulseekProvider(MusicProvider):
     ) -> StreamDetails:
         if media_type != MediaType.TRACK:
             raise UnplayableMediaError("Soulseek playback is available for tracks only")
-        cached = await self._cache.lookup(item_id, self._quality)
-        if cached:
-            return StreamDetails(
-                provider=self.instance_id,
-                item_id=item_id,
-                audio_format=AudioFormat(
-                    content_type=ContentType.try_parse(cached.extension),
-                    bit_rate=cached.bitrate or None,
-                ),
-                stream_type=StreamType.LOCAL_FILE,
-                path=cached.path,
-                can_seek=True,
-                allow_seek=True,
-                duration=cached.duration,
-            )
-
         track = await self._catalog.track_page(item_id)
         return StreamDetails(
             provider=self.instance_id,
@@ -380,20 +333,7 @@ class SoulseekProvider(MusicProvider):
     async def get_audio_stream(
         self, streamdetails: StreamDetails, seek_position: int = 0
     ) -> AsyncGenerator[bytes, None]:
-        """Protect the active track from LRU eviction while it is streaming."""
-
-        await self._cache.set_active(streamdetails.item_id, True)
-        try:
-            async for chunk in self._get_uncached_audio_stream(
-                streamdetails, seek_position
-            ):
-                yield chunk
-        finally:
-            await self._cache.set_active(streamdetails.item_id, False)
-
-    async def _get_uncached_audio_stream(
-        self, streamdetails: StreamDetails, seek_position: int = 0
-    ) -> AsyncGenerator[bytes, None]:
+        """Yield incoming audio directly from memory as soon as it arrives."""
         del seek_position
         data = streamdetails.data if isinstance(streamdetails.data, dict) else {}
         track_data = data.get("track")
@@ -415,111 +355,61 @@ class SoulseekProvider(MusicProvider):
             raise UnplayableMediaError(str(err)) from err
 
         handle: DownloadHandle | None = None
-        for peer_file in diversify_peers(ranked, limit=3):
-            download_folder = await self._cache.prepare_download(
-                track_id=streamdetails.item_id,
-                profile=self._quality,
-                duration=track.duration,
-                bitrate=peer_file.bitrate,
-            )
-            try:
-                candidate = await self._client.start_download(
-                    peer_file,
-                    folder=download_folder,
-                    context={
-                        "track_id": streamdetails.item_id,
-                        "profile": self._quality,
-                        "duration": track.duration,
-                        "bitrate": peer_file.bitrate,
-                    },
-                )
-            except Exception as err:  # noqa: BLE001 - one peer must not block failover
-                self.logger.warning(
-                    "Could not start Soulseek download from %s: %s",
-                    peer_file.username,
-                    err,
-                )
-                continue
-            if await self._wait_for_first_bytes(candidate):
-                handle = candidate
-                break
-            await self._client.abort_download(candidate)
-        if handle is None:
-            raise UnplayableMediaError(
-                "No Soulseek peer delivered audio within 20 seconds"
-            )
-
-        file_handle: Any = None
-        emitted = False
-        last_progress = time.monotonic()
-        last_size = -1
         try:
+            for peer_file in diversify_peers(ranked, limit=3):
+                try:
+                    handle = await self._client.start_download(peer_file)
+                except Exception as err:  # noqa: BLE001 - allow peer failover
+                    self.logger.warning(
+                        "Could not start Soulseek transfer from %s: %s",
+                        peer_file.username,
+                        err,
+                    )
+                    continue
+                if await self._wait_for_first_bytes(handle):
+                    break
+                await self._client.abort_download(handle)
+                handle = None
+            if handle is None:
+                raise UnplayableMediaError("No Soulseek peer delivered audio within 20 seconds")
+
+            offset = 0
+            last_progress = time.monotonic()
             while True:
-                if file_handle is None:
-                    path = Path(handle.path)
-                    if path.is_file():
-                        file_handle = await asyncio.to_thread(path.open, "rb")
-                    else:
-                        if handle.failed:
-                            raise UnplayableMediaError(
-                                f"Soulseek download failed before playback: {handle.error}"
-                            )
-                        await asyncio.sleep(0.1)
-                        continue
-                chunk = await asyncio.to_thread(file_handle.read, STREAM_CHUNK_SIZE)
+                # Clear before inspecting state so a network write cannot be lost
+                # between the read and wait. Bytes wake playback immediately.
+                handle.updated.clear()
+                chunk = handle.buffer.read(offset, STREAM_CHUNK_SIZE)
                 if chunk:
-                    emitted = True
+                    offset += len(chunk)
                     last_progress = time.monotonic()
                     yield chunk
                     continue
-
-                if handle.finished:
-                    return
                 if handle.failed:
                     raise UnplayableMediaError(
-                        f"Soulseek download stopped during playback: {handle.error}"
+                        f"Soulseek transfer stopped during playback: {handle.error}"
                     )
-                with suppress(OSError):
-                    current_size = Path(handle.path).stat().st_size
-                    if current_size != last_size:
-                        last_size = current_size
-                        last_progress = time.monotonic()
-                if time.monotonic() - last_progress >= MIDSTREAM_STALL_TIMEOUT:
-                    # Once audio was emitted we deliberately do not switch files: doing so
-                    # would splice two encodings or two different recordings together.
-                    suffix = " after playback began" if emitted else ""
-                    raise UnplayableMediaError(f"Soulseek transfer stalled{suffix}")
-                handle.updated.clear()
+                if handle.finished:
+                    return
+                remaining = MIDSTREAM_STALL_TIMEOUT - (time.monotonic() - last_progress)
+                if remaining <= 0:
+                    raise UnplayableMediaError("Soulseek transfer stalled after playback began")
                 with suppress(TimeoutError):
-                    await asyncio.wait_for(handle.updated.wait(), timeout=0.25)
+                    await asyncio.wait_for(handle.updated.wait(), timeout=remaining)
         finally:
-            if file_handle is not None:
-                await asyncio.to_thread(file_handle.close)
-            # Do not abort here: a selected transfer keeps downloading after a player
-            # stops, so the completed file is available for a future local replay.
+            if handle is not None:
+                await self._client.abort_download(handle)
 
     async def _wait_for_first_bytes(self, handle: DownloadHandle) -> bool:
         deadline = time.monotonic() + FIRST_BYTE_TIMEOUT
-        while time.monotonic() < deadline:
+        while True:
+            handle.updated.clear()
             if handle.failed:
                 return False
-            if handle.path:
-                with suppress(OSError):
-                    if Path(handle.path).stat().st_size > 0:
-                        return True
-            handle.updated.clear()
+            if handle.buffer is not None and len(handle.buffer):
+                return True
+            remaining = deadline - time.monotonic()
+            if handle.finished or remaining <= 0:
+                return False
             with suppress(TimeoutError):
-                await asyncio.wait_for(handle.updated.wait(), timeout=0.25)
-        return False
-
-    def _on_download_complete(self, handle: DownloadHandle) -> None:
-        async def record() -> None:
-            await self._cache.record(
-                track_id=str(handle.context["track_id"]),
-                profile=str(handle.context["profile"]),
-                path=handle.path,
-                duration=handle.context.get("duration"),
-                bitrate=int(handle.context.get("bitrate") or 0),
-            )
-
-        asyncio.create_task(record())
+                await asyncio.wait_for(handle.updated.wait(), timeout=remaining)

@@ -9,15 +9,14 @@ import os
 import secrets
 import string
 import threading
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from music_assistant_models.errors import SetupFailedError
 
-from .cache import DownloadCache
+from .memory import MAX_AUDIO_BYTES, AudioBuffer, create_memory_downloads
 from .ranking import PeerFile, deduplicate_variants
+from .storage import RuntimeStorage
 
 SEARCH_WINDOW_SECONDS = 8
 MAX_SEARCH_RESULTS = 100
@@ -35,10 +34,9 @@ def _nonnegative_int(value: Any) -> int | None:
 @dataclass(slots=True)
 class DownloadHandle:
     peer_file: PeerFile
-    folder: Path
-    context: dict[str, Any]
+    buffer: AudioBuffer | None = None
+    consumers: int = 1
     transfer: Any = None
-    path: str = ""
     status: str = "Queued"
     finished: bool = False
     failed: bool = False
@@ -53,16 +51,14 @@ class SoulseekClient:
         self,
         *,
         loop: asyncio.AbstractEventLoop,
-        cache: DownloadCache,
+        storage: RuntimeStorage,
         listen_port: int,
         logger: Any,
-        on_download_complete: Callable[[DownloadHandle], None] | None = None,
     ) -> None:
         self.loop = loop
-        self.cache = cache
+        self.storage = storage
         self.listen_port = listen_port
         self.logger = logger
-        self.on_download_complete = on_download_complete
         self._core: Any = None
         self._config: Any = None
         self._events: Any = None
@@ -77,6 +73,7 @@ class SoulseekClient:
         self._search_lock = threading.Lock()
         self._handles: dict[str, DownloadHandle] = {}
         self._handles_lock = threading.Lock()
+        self._transfer_lock = asyncio.Lock()
         self._started = False
 
     async def start(self) -> None:
@@ -116,7 +113,7 @@ class SoulseekClient:
 
         credentials = self._load_credentials() or self._generate_credentials()
         self._pending_credentials = credentials
-        data_path = self.cache.nicotine_data_path
+        data_path = self.storage.nicotine_data_path
         data_path.mkdir(parents=True, exist_ok=True)
         self._config.set_data_folder(str(data_path))
         self._config.set_config_file(str(data_path / "config"))
@@ -129,17 +126,19 @@ class SoulseekClient:
             "network_filter",
             "statistics",
             "search",
-            "downloads",
             "buddies",
             "pluginhandler",
         }
         with self._lock:
             self._core.init_components(components, isolated_mode=True)
+            self._core.downloads = create_memory_downloads(self)
+            self._core.enabled_components.add("downloads")
             self._configure(credentials)
             self._events.connect("server-login", self._on_server_login)
             self._events.connect("server-disconnect", self._on_server_disconnect)
             self._events.connect("file-search-response", self._on_search_response)
             self._events.connect("update-download", self._on_download_update)
+            self._events.connect("abort-download", self._on_download_abort)
             self._core.start()
             self._core.connect()
         self._stop_event.clear()
@@ -159,8 +158,7 @@ class SoulseekClient:
         sections["server"]["auto_connect_startup"] = False
         sections["server"]["upnp"] = False
         transfers = sections["transfers"]
-        transfers["downloaddir"] = str(self.cache.downloads_path)
-        transfers["incompletedir"] = str(self.cache.incomplete_path)
+        transfers["autoclear_downloads"] = False
         transfers["shared"] = []
         transfers["buddyshared"] = []
         transfers["trustedshared"] = []
@@ -184,7 +182,7 @@ class SoulseekClient:
 
     def _load_credentials(self) -> tuple[str, str] | None:
         try:
-            value = json.loads(self.cache.credentials_path.read_text(encoding="utf-8"))
+            value = json.loads(self.storage.credentials_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return None
         username = str(value.get("username") or "")
@@ -199,7 +197,7 @@ class SoulseekClient:
         return username, password
 
     def _persist_credentials(self, credentials: tuple[str, str]) -> None:
-        temporary = self.cache.credentials_path.with_suffix(".tmp")
+        temporary = self.storage.credentials_path.with_suffix(".tmp")
         temporary.write_text(
             json.dumps(
                 {"username": credentials[0], "password": credentials[1]}, indent=2
@@ -207,7 +205,7 @@ class SoulseekClient:
             encoding="utf-8",
         )
         os.chmod(temporary, 0o600)
-        os.replace(temporary, self.cache.credentials_path)
+        os.replace(temporary, self.storage.credentials_path)
 
     def _on_server_login(self, msg: Any) -> None:
         success = bool(getattr(msg, "success", False))
@@ -313,15 +311,6 @@ class SoulseekClient:
             handle = self._handles.get(key)
         if handle is None:
             return
-        try:
-            path = str(
-                self._core.downloads.get_current_download_file_path(transfer) or ""
-            )
-        except Exception as err:  # noqa: BLE001 - external transfer may be half-removed
-            self.logger.debug(
-                "Could not resolve current Soulseek download path: %s", err
-            )
-            path = handle.path
         status = str(getattr(transfer, "status", ""))
         finished_value = str(getattr(self._transfer_status, "FINISHED", "Finished"))
         failed_values = {
@@ -352,16 +341,17 @@ class SoulseekClient:
         )
 
         def apply() -> None:
-            handle.path = path or handle.path
             handle.status = status
             handle.finished = status == finished_value
             handle.failed = status in failed_values
             handle.error = status if handle.failed else ""
             handle.updated.set()
-            if handle.finished and self.on_download_complete:
-                self.on_download_complete(handle)
 
         self.loop.call_soon_threadsafe(apply)
+
+    def _on_download_abort(self, transfer: Any, status: Any, update_parent: bool = True) -> None:
+        del status
+        self._on_download_update(transfer, update_parent)
 
     async def search_variants(self, query: str) -> list[PeerFile]:
         def begin() -> int:
@@ -389,28 +379,33 @@ class SoulseekClient:
         await asyncio.to_thread(finish)
         return deduplicate_variants(results)[:MAX_SEARCH_RESULTS]
 
-    async def start_download(
-        self,
-        peer_file: PeerFile,
-        *,
-        folder: Path,
-        context: dict[str, Any],
-    ) -> DownloadHandle:
+    async def start_download(self, peer_file: PeerFile) -> DownloadHandle:
+        async with self._transfer_lock:
+            return await self._start_download(peer_file)
+
+    async def _start_download(self, peer_file: PeerFile) -> DownloadHandle:
+        if peer_file.size > MAX_AUDIO_BYTES:
+            raise ValueError("Soulseek audio exceeds the 256 MiB memory limit")
         key = self._handle_key(peer_file.username, peer_file.path)
         with self._handles_lock:
             existing = self._handles.get(key)
-        if existing is not None and not existing.failed:
-            return existing
-        handle = DownloadHandle(peer_file=peer_file, folder=folder, context=context)
-        with self._handles_lock:
+            if existing is not None:
+                if existing.failed:
+                    raise RuntimeError("Soulseek transfer has failed")
+                existing.consumers += 1
+                return existing
+            handle = DownloadHandle(peer_file=peer_file)
+            handle.buffer = AudioBuffer(
+                lambda: self.loop.call_soon_threadsafe(handle.updated.set)
+            )
             self._handles[key] = handle
 
-        def enqueue() -> tuple[Any, str]:
+        def enqueue() -> Any:
             with self._lock:
                 self._core.downloads.enqueue_download(
                     peer_file.username,
                     peer_file.path,
-                    folder_path=str(folder),
+                    folder_path="memory",
                     size=peer_file.size,
                     file_attributes=peer_file.file_attributes,
                 )
@@ -418,21 +413,33 @@ class SoulseekClient:
                     peer_file.username + peer_file.path
                 )
                 if transfer is None:
-                    raise RuntimeError("Nicotine+ did not create a download transfer")
-                path = self._core.downloads.get_current_download_file_path(transfer)
-                return transfer, str(path or "")
+                    raise RuntimeError("Nicotine+ did not create a transfer")
+                return transfer
 
+        # Shield enqueue so cancellation cannot orphan a live network transfer.
+        pending = asyncio.create_task(asyncio.to_thread(enqueue))
         try:
-            handle.transfer, handle.path = await asyncio.to_thread(enqueue)
-        except Exception:
-            # Preserve the external peer error for provider-level failover.
-            with self._handles_lock:
-                self._handles.pop(key, None)
+            handle.transfer = await asyncio.shield(pending)
+        except BaseException:
+            try:
+                handle.transfer = await pending
+            finally:
+                await self._abort_download(handle)
             raise
         self._on_download_update(handle.transfer)
         return handle
 
     async def abort_download(self, handle: DownloadHandle) -> None:
+        async with self._transfer_lock:
+            await self._abort_download(handle)
+
+    async def _abort_download(self, handle: DownloadHandle) -> None:
+        with self._handles_lock:
+            if handle.consumers <= 0:
+                return
+            handle.consumers -= 1
+            if handle.consumers > 0:
+                return
         transfer = handle.transfer
 
         def abort() -> None:
@@ -451,12 +458,15 @@ class SoulseekClient:
                             "Could not clear aborted Soulseek transfer: %s", err
                         )
 
-        await asyncio.to_thread(abort)
-        with self._handles_lock:
-            self._handles.pop(
-                self._handle_key(handle.peer_file.username, handle.peer_file.path), None
-            )
-        await self.cache.remove_incomplete(handle.path)
+        try:
+            await asyncio.to_thread(abort)
+        finally:
+            with self._handles_lock:
+                self._handles.pop(
+                    self._handle_key(handle.peer_file.username, handle.peer_file.path), None
+                )
+            if handle.buffer is not None:
+                handle.buffer.release()
 
     async def stop(self) -> None:
         if self._core is None:
@@ -472,6 +482,14 @@ class SoulseekClient:
                     except Exception as err:  # noqa: BLE001 - best-effort external shutdown
                         self.logger.debug("Nicotine+ quit reported an error: %s", err)
 
+        with self._handles_lock:
+            handles = list(self._handles.values())
+        for handle in handles:
+            handle.consumers = 1
+            await self.abort_download(handle)
+            handle.failed = True
+            handle.error = "Provider stopped"
+            handle.updated.set()
         await asyncio.to_thread(shutdown)
         self._stop_event.set()
         if self._event_thread and self._event_thread.is_alive():

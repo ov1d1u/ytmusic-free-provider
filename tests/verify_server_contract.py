@@ -89,17 +89,13 @@ def main() -> None:
     if version("nicotine-plus") != "3.3.11":
         raise SystemExit("Soulseek requires nicotine-plus==3.3.11")
     entries = {entry.key: entry for entry in soulseek_provider._build_config_entries()}
-    expected_entries = {"audio_quality", "listen_port", "cache_limit_gb"}
+    expected_entries = {"audio_quality", "listen_port"}
     if set(entries) != expected_entries:
         raise SystemExit(f"Unexpected Soulseek settings: {set(entries)!r}")
     if entries["audio_quality"].default_value != "mp3":
         raise SystemExit("Soulseek audio quality no longer defaults to MP3")
     if entries["listen_port"].range != (1024, 65535):
         raise SystemExit("Soulseek listen-port validation range changed")
-    if entries["cache_limit_gb"].default_value != 5:
-        raise SystemExit("Soulseek cache no longer defaults to 5 GB")
-    if entries["cache_limit_gb"].range != (1, 1000):
-        raise SystemExit("Soulseek cache validation range changed")
     print(f"soulseek dependency and config contract ok: {type(pynicotine.core).__name__}")
 
     from music_assistant.controllers.cache import BYPASS_CACHE, use_cache

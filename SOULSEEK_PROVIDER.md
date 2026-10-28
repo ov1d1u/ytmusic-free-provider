@@ -40,8 +40,8 @@ docker compose up -d --build
 ```
 
 Open `http://HOST_IP:8095`, then add **Soulseek** under Music providers. Runtime
-state, generated Soulseek credentials, incomplete transfers, and completed
-downloads are persisted in `./data` by default.
+state and generated Soulseek credentials are persisted in `./data` by default.
+Audio bytes stay in memory and are released when playback ends.
 
 Optional settings can be placed in `.env`:
 
@@ -77,8 +77,6 @@ isolation.
 - **Audio quality** defaults to **Standard (MP3)**. **High (FLAC)** prefers
   FLAC, but each mode can fall back to the other format when necessary.
 - **Soulseek listen port** defaults to TCP `2234`.
-- **Download cache limit** defaults to **5 GB**. It accepts values from 1 to
-  1000 GB and removes the least-recently accessed completed tracks first.
 
 MusicBrainz needs no API key. Artist IDs are MusicBrainz artist MBIDs, album IDs
 are release-group MBIDs, and track IDs are recording MBIDs. The client identifies
@@ -102,20 +100,18 @@ Persistent files live below Music Assistant's storage directory:
 
 ```text
 soulseek/
-├── cache_index.json
 ├── credentials.json
-├── downloads/
-├── incomplete/
 └── nicotine/
 ```
 
-Completed files form a persistent, size-bounded LRU cache. Successful cache
-access updates a track's recency, and the provider enforces the configured limit
-at startup and after each completed transfer. Active and incomplete downloads
-are protected from eviction. The atomic cache index is reconciled with files at
-startup; missing files are dropped, while older rows gain an access timestamp
-from their file modification time. Shares are configured as empty and upload
-slots are disabled: downloaded files are not offered back to Soulseek peers.
+Audio is received only into memory, with a 256 MiB limit per transfer. Playback
+can read the first bytes immediately while the peer is still sending the rest.
+Transfers larger than the limit fail cleanly. Shares are empty and upload slots
+are disabled. Audio is never offered back to peers.
+
+The provider no longer reads or creates an audio cache. Existing `downloads/`,
+`incomplete/`, and `cache_index.json` files from older versions are left untouched
+and can be removed manually. The old download cache limit setting is ignored.
 
 ## Matching and playback
 
@@ -130,12 +126,13 @@ advertised upload speed are preferred before bitrate, peer, and path resolve
 remaining ties deterministically. Missing peer metrics remain valid candidates
 but never outrank known favorable values solely because data is absent.
 
-On a cache miss, the provider tries the top three peers. Each gets 20 seconds to
+The provider tries the top three peers. Each gets 20 seconds to
 produce the first bytes. Failover is allowed only before audio is emitted. Once
 playback begins, the provider never splices another file into the stream; a
-later stall fails cleanly and replay performs a fresh resolution. Downloads
-continue after playback stops, and completed files replay as seekable local
-files.
+later stall fails cleanly and replay performs a fresh resolution. Stopping
+playback cancels the transfer and releases its audio buffer. Concurrent players
+using the same peer file share a transfer until the last player stops. Streams
+are not seekable and completed audio is not retained for replay.
 
 ## Catalog behavior
 
@@ -173,19 +170,16 @@ are requested from the separate Cover Art Archive service.
   forward the listen port. Try a well-known track with several peers.
 - **MusicBrainz error:** confirm `musicbrainz.org` is reachable and wait before
   retrying. HTTP 429 and 503 responses are retried with bounded backoff.
-- **Cache evicts tracks sooner than expected:** raise the advanced download
-  cache limit. Only completed, inactive tracks are eligible for LRU eviction.
 - **A track starts then stops:** the selected peer stalled. The provider will
   not switch files midstream; replay the track to resolve it again.
 
 ## Manual end-to-end check
 
 1. Search for an artist and open its albums and recordings.
-2. Start an uncached track and confirm playback begins while the file grows in
-   `soulseek/incomplete` or `soulseek/downloads`.
-3. Let it finish, replay it, and confirm it is served as a seekable local file.
-4. Restart Music Assistant and replay again to verify the persistent cache.
-5. Confirm the completed file does not appear in the configured Soulseek shares.
+2. Start a track and confirm playback begins before the transfer finishes.
+3. Confirm no audio files appear in persistent storage during playback.
+4. Stop playback and confirm the transfer stops and its buffer is released.
+5. Replay the track and confirm it resolves a peer again.
 
 Live MusicBrainz compatibility is checked only as an advisory canary. Live
 Soulseek behavior is deliberately excluded from deterministic CI because peer

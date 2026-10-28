@@ -9,8 +9,8 @@ An independent, community-built provider that adds free YouTube Music streaming 
 
 This repository also ships an experimental, single-instance **Soulseek** music
 provider. It uses MusicBrainz for catalog metadata and Nicotine+ for progressive
-FLAC/MP3 playback, with duration-aware candidate matching and a bounded local
-replay cache. The existing YouTube Music provider remains the default for the
+FLAC/MP3 playback, with duration-aware candidate matching and immediate playback from
+in-memory audio buffers. The existing YouTube Music provider remains the default for the
 installer and retains its current behavior.
 
 See [SOULSEEK_PROVIDER.md](SOULSEEK_PROVIDER.md) for installation, networking,
